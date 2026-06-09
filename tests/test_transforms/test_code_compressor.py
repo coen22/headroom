@@ -14,11 +14,15 @@ from unittest.mock import patch
 import pytest
 
 from headroom.transforms.code_compressor import (
+    _LANG_CONFIGS,
     CodeAwareCompressor,
     CodeCompressionResult,
     CodeCompressorConfig,
     CodeLanguage,
+    CodeProfile,
     DocstringMode,
+    _get_parser,
+    _normalize_language,
     detect_language,
     is_tree_sitter_available,
     is_tree_sitter_loaded,
@@ -207,6 +211,50 @@ def generate_go_code(n_functions: int = 3) -> str:
     return "\n".join(lines)
 
 
+def generate_csharp_code() -> str:
+    """Generate C# code for testing."""
+    return """
+using System;
+using System.Collections.Generic;
+
+public class CustomerService
+{
+    private readonly List<string> events = new();
+
+    public CustomerService()
+    {
+        events.Add("created");
+        events.Add("initialized");
+        events.Add(DateTime.UtcNow.ToString("O"));
+    }
+
+    public string FormatName(string? first, string? last)
+    {
+        var parts = new List<string>();
+        if (!string.IsNullOrWhiteSpace(first))
+        {
+            parts.Add(first.Trim());
+        }
+        if (!string.IsNullOrWhiteSpace(last))
+        {
+            parts.Add(last.Trim());
+        }
+        return string.Join(" ", parts);
+    }
+}
+"""
+
+
+def require_csharp_parser() -> None:
+    """Skip the current test unless the optional C# parser is available."""
+    if not TREE_SITTER_INSTALLED:
+        pytest.skip("tree-sitter-languages not installed")
+    try:
+        _get_parser("csharp")
+    except Exception as exc:
+        pytest.skip(f"tree-sitter C# parser unavailable: {exc}")
+
+
 # =============================================================================
 # TestCodeCompressorConfig
 # =============================================================================
@@ -332,6 +380,33 @@ class TestCodeLanguage:
         values = [lang.value for lang in CodeLanguage]
         assert len(values) == len(set(values))
 
+    def test_csharp_language_aliases_normalize(self):
+        """Common C#/.NET/Unity aliases normalize to C# plus a profile."""
+        expected = {
+            "c#": CodeProfile.GENERIC,
+            "cs": CodeProfile.GENERIC,
+            "csharp": CodeProfile.GENERIC,
+            "c-sharp": CodeProfile.GENERIC,
+            ".net": CodeProfile.DOTNET,
+            "dotnet": CodeProfile.DOTNET,
+            "unity": CodeProfile.UNITY,
+            "aspnetcore": CodeProfile.ASPNET_CORE,
+            "asp.net core": CodeProfile.ASPNET_CORE,
+        }
+
+        for alias, profile in expected.items():
+            assert _normalize_language(alias) == (CodeLanguage.CSHARP, profile)
+
+    def test_csharp_config_is_conservative_about_properties(self):
+        """C# first pass does not treat properties/events/indexers as functions."""
+        config = _LANG_CONFIGS[CodeLanguage.CSHARP]
+
+        assert "method_declaration" in config.function_nodes
+        assert "constructor_declaration" in config.function_nodes
+        assert "property_declaration" not in config.function_nodes
+        assert "event_declaration" not in config.function_nodes
+        assert "indexer_declaration" not in config.function_nodes
+
     def test_detect_python_language(self):
         """Python language is detected from code patterns."""
 
@@ -382,6 +457,41 @@ func main() {
         assert lang == CodeLanguage.GO
         assert confidence > 0.3
 
+    def test_detect_csharp_language_from_unity_markers(self):
+        """C# language is detected from Unity-specific source markers."""
+        code = """
+using UnityEngine;
+
+public class PlayerController : MonoBehaviour
+{
+    [SerializeField] private Rigidbody body;
+}
+"""
+        with patch(
+            "headroom.transforms.code_compressor._check_tree_sitter_available", return_value=False
+        ):
+            lang, confidence = detect_language(code)
+
+        assert lang == CodeLanguage.CSHARP
+        assert confidence > 0.3
+
+    def test_detect_csharp_language_from_aspnet_markers(self):
+        """C# language is detected from ASP.NET Core source markers."""
+        code = """
+using Microsoft.AspNetCore.Builder;
+
+var builder = WebApplication.CreateBuilder(args);
+var app = builder.Build();
+app.MapGet("/health", () => Results.Ok());
+"""
+        with patch(
+            "headroom.transforms.code_compressor._check_tree_sitter_available", return_value=False
+        ):
+            lang, confidence = detect_language(code)
+
+        assert lang == CodeLanguage.CSHARP
+        assert confidence > 0.3
+
 
 # =============================================================================
 # TestCodeAwareCompressor
@@ -427,6 +537,458 @@ class TestCodeAwareCompressor:
 
         # Should detect or use the specified language
         assert result.language == CodeLanguage.PYTHON or result.language == CodeLanguage.UNKNOWN
+
+    def test_compress_accepts_csharp_aliases_without_tree_sitter(self):
+        """Explicit C# aliases are accepted before optional parser loading."""
+        config = CodeCompressorConfig(
+            min_tokens_for_compression=10,
+            fallback_to_kompress=False,
+            enable_ccr=False,
+        )
+        compressor = CodeAwareCompressor(config)
+        code = generate_csharp_code()
+
+        with patch(
+            "headroom.transforms.code_compressor._check_tree_sitter_available", return_value=False
+        ):
+            expected_profiles = {
+                "c#": CodeProfile.GENERIC,
+                "cs": CodeProfile.GENERIC,
+                "dotnet": CodeProfile.DOTNET,
+                "unity": CodeProfile.UNITY,
+                "asp.net core": CodeProfile.ASPNET_CORE,
+            }
+            for alias, expected_profile in expected_profiles.items():
+                result = compressor.compress(code, language=alias)
+                assert result.language == CodeLanguage.CSHARP
+                assert result.profile == expected_profile
+                assert result.syntax_valid is True
+
+    def test_csharp_profile_is_inferred_from_source_markers_without_tree_sitter(self):
+        """Generic C# language hints infer framework profiles from source markers."""
+        config = CodeCompressorConfig(
+            min_tokens_for_compression=10,
+            fallback_to_kompress=False,
+            enable_ccr=False,
+        )
+        compressor = CodeAwareCompressor(config)
+        unity_code = """
+using UnityEngine;
+
+public class PlayerController : MonoBehaviour
+{
+    private void Update()
+    {
+        transform.Translate(Vector3.forward * Time.deltaTime);
+    }
+}
+"""
+        aspnet_code = """
+using Microsoft.AspNetCore.Builder;
+
+var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddValidation();
+var app = builder.Build();
+app.MapGet("/health", () => Results.Ok());
+"""
+
+        with patch(
+            "headroom.transforms.code_compressor._check_tree_sitter_available", return_value=False
+        ):
+            unity_result = compressor.compress(unity_code, language="csharp")
+            aspnet_result = compressor.compress(aspnet_code, language="csharp")
+
+        assert unity_result.profile == CodeProfile.UNITY
+        assert aspnet_result.profile == CodeProfile.ASPNET_CORE
+
+    def test_explicit_profile_overrides_inferred_profile_without_tree_sitter(self):
+        """Explicit profile hints override source-marker inference."""
+        config = CodeCompressorConfig(
+            min_tokens_for_compression=10,
+            fallback_to_kompress=False,
+            enable_ccr=False,
+        )
+        compressor = CodeAwareCompressor(config)
+        code = """
+using Microsoft.AspNetCore.Builder;
+
+var builder = WebApplication.CreateBuilder(args);
+var app = builder.Build();
+app.MapGet("/health", () => Results.Ok());
+"""
+
+        with patch(
+            "headroom.transforms.code_compressor._check_tree_sitter_available", return_value=False
+        ):
+            result = compressor.compress(code, language="csharp", profile="dotnet")
+
+        assert result.language == CodeLanguage.CSHARP
+        assert result.profile == CodeProfile.DOTNET
+
+    def test_small_explicit_csharp_preserves_language_and_profile(self):
+        """Small explicit C# snippets still expose language/profile metadata."""
+        compressor = CodeAwareCompressor(CodeCompressorConfig(min_tokens_for_compression=1000))
+
+        result = compressor.compress("public class Player : MonoBehaviour {}", language="unity")
+
+        assert result.language == CodeLanguage.CSHARP
+        assert result.profile == CodeProfile.UNITY
+
+    def test_efcore_profile_is_inferred_without_tree_sitter(self):
+        """EF Core source markers infer the EF Core profile."""
+        config = CodeCompressorConfig(
+            min_tokens_for_compression=10,
+            fallback_to_kompress=False,
+            enable_ccr=False,
+        )
+        compressor = CodeAwareCompressor(config)
+        code = """
+using Microsoft.EntityFrameworkCore;
+
+public class AppDbContext : DbContext
+{
+        public DbSet<Product> Products => Set<Product>();
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+                modelBuilder.Entity<Product>().HasKey(product => product.Id);
+                modelBuilder.Entity<Product>().HasQueryFilter(product => !product.Deleted);
+        }
+}
+"""
+
+        with patch(
+            "headroom.transforms.code_compressor._check_tree_sitter_available",
+            return_value=False,
+        ):
+            result = compressor.compress(code, language="csharp")
+
+        assert result.language == CodeLanguage.CSHARP
+        assert result.profile == CodeProfile.EF_CORE
+
+    def test_razor_artifact_preserves_directives_and_code_block(self):
+        """Razor artifacts are compressed without using the C# parser."""
+        compressor = CodeAwareCompressor(CodeCompressorConfig(min_tokens_for_compression=1))
+        code = """
+@page "/products/{id:int}"
+@using System.ComponentModel.DataAnnotations
+@inject ProductService Products
+
+<h1>Product</h1>
+<p>Lots of markup that can be summarized.</p>
+
+@code {
+        [Parameter] public int Id { get; set; }
+        [PersistentState] public Product? Product { get; set; }
+}
+"""
+
+        result = compressor.compress(code, language="razor")
+
+        assert result.language == CodeLanguage.RAZOR
+        assert result.profile == CodeProfile.ASPNET_CORE
+        assert "@page" in result.compressed
+        assert "@inject" in result.compressed
+        assert "[PersistentState]" in result.compressed
+        assert "lines omitted" in result.compressed
+
+    def test_msbuild_artifact_preserves_frameworks_and_references(self):
+        """MSBuild project files keep target frameworks and important references."""
+        compressor = CodeAwareCompressor(CodeCompressorConfig(min_tokens_for_compression=1))
+        code = """
+<Project Sdk="Microsoft.NET.Sdk.Web">
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <Nullable>enable</Nullable>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <GenerateOpenApiDocuments>true</GenerateOpenApiDocuments>
+    </PropertyGroup>
+    <ItemGroup>
+        <PackageReference Include="Microsoft.EntityFrameworkCore" Version="10.0.0" />
+        <ProjectReference Include="..\\Domain\\Domain.csproj" />
+    </ItemGroup>
+</Project>
+"""
+
+        result = compressor.compress(code, language="csproj")
+
+        assert result.language == CodeLanguage.MSBUILD
+        assert result.profile == CodeProfile.DOTNET
+        assert "<TargetFramework>net10.0</TargetFramework>" in result.compressed
+        assert "<GenerateOpenApiDocuments>true</GenerateOpenApiDocuments>" in result.compressed
+        assert "PackageReference" in result.compressed
+        assert "ProjectReference" in result.compressed
+
+    def test_unity_asmdef_json_keeps_important_keys(self):
+        """Unity asmdef JSON keeps assembly metadata and omits unrelated keys."""
+        compressor = CodeAwareCompressor(CodeCompressorConfig(min_tokens_for_compression=1))
+        code = """
+{
+    "name": "Game.Runtime",
+    "references": ["Unity.TextMeshPro"],
+    "includePlatforms": [],
+    "defineConstraints": ["UNITY_6000_0_OR_NEWER"],
+    "allowUnsafeCode": false,
+    "optionalUnityReferences": ["TestAssemblies"]
+}
+"""
+
+        result = compressor.compress(code, language="asmdef")
+
+        assert result.language == CodeLanguage.JSON
+        assert result.profile == CodeProfile.UNITY
+        assert '"name": "Game.Runtime"' in result.compressed
+        assert '"references"' in result.compressed
+        assert "optionalUnityReferences" not in result.compressed
+
+    def test_unity_package_manifest_keeps_entities_dependency(self):
+        """Unity package manifests preserve com.unity.entities dependencies."""
+        compressor = CodeAwareCompressor(CodeCompressorConfig(min_tokens_for_compression=1))
+        code = """
+{
+    "dependencies": {
+        "com.unity.entities": "1.3.14",
+        "com.unity.collections": "2.5.1",
+        "com.unity.render-pipelines.universal": "17.0.0"
+    },
+    "scopedRegistries": [
+        { "name": "Unity", "url": "https://packages.unity.com", "scopes": ["com.unity"] }
+    ],
+    "lock": { "unrelated": true }
+}
+"""
+
+        result = compressor.compress(code, language="unity-manifest")
+
+        assert result.language == CodeLanguage.JSON
+        assert result.profile == CodeProfile.UNITY
+        assert '"com.unity.entities": "1.3.14"' in result.compressed
+        assert '"scopedRegistries"' in result.compressed
+        assert '"lock"' not in result.compressed
+
+    def test_unity_entities_profile_is_inferred_without_tree_sitter(self):
+        """Unity Entities interfaces infer Unity profile and preserve metadata."""
+        config = CodeCompressorConfig(
+            min_tokens_for_compression=10,
+            fallback_to_kompress=False,
+            enable_ccr=False,
+        )
+        compressor = CodeAwareCompressor(config)
+        code = """
+using Unity.Burst;
+using Unity.Entities;
+using Unity.Mathematics;
+using Unity.Transforms;
+
+public struct MoveSpeed : IComponentData
+{
+    public float Value;
+}
+
+[BurstCompile]
+public partial struct MoveSystem : ISystem
+{
+    public void OnUpdate(ref SystemState state)
+    {
+        foreach (var (transform, speed) in SystemAPI.Query<RefRW<LocalTransform>, RefRO<MoveSpeed>>())
+        {
+            transform.ValueRW.Position += new float3(speed.ValueRO.Value, 0, 0);
+        }
+    }
+}
+"""
+
+        with patch(
+            "headroom.transforms.code_compressor._check_tree_sitter_available",
+            return_value=False,
+        ):
+            result = compressor.compress(code, language="csharp")
+
+        assert result.language == CodeLanguage.CSHARP
+        assert result.profile == CodeProfile.UNITY
+
+    def test_burst_compile_profile_is_inferred_without_tree_sitter(self):
+        """Burst-only Unity jobs infer the Unity profile."""
+        config = CodeCompressorConfig(
+            min_tokens_for_compression=10,
+            fallback_to_kompress=False,
+            enable_ccr=False,
+        )
+        compressor = CodeAwareCompressor(config)
+        code = """
+using Unity.Burst;
+
+[BurstCompile]
+public struct IntegrateJob
+{
+    public void Execute()
+    {
+        var value = 1 + 2;
+    }
+}
+"""
+
+        with patch(
+            "headroom.transforms.code_compressor._check_tree_sitter_available",
+            return_value=False,
+        ):
+            result = compressor.compress(code, language="csharp")
+
+        assert result.language == CodeLanguage.CSHARP
+        assert result.profile == CodeProfile.UNITY
+
+    def test_dotnet_console_profile_is_inferred_without_tree_sitter(self):
+        """Top-level console apps infer the .NET profile."""
+        config = CodeCompressorConfig(
+            min_tokens_for_compression=1,
+            fallback_to_kompress=False,
+            enable_ccr=False,
+        )
+        compressor = CodeAwareCompressor(config)
+        code = """
+Console.WriteLine("Hello, Headroom!");
+var name = Console.ReadLine();
+Console.WriteLine($"Hello {name}");
+"""
+
+        with patch(
+            "headroom.transforms.code_compressor._check_tree_sitter_available",
+            return_value=False,
+        ):
+            result = compressor.compress(code, language="csharp")
+
+        assert result.language == CodeLanguage.CSHARP
+        assert result.profile == CodeProfile.DOTNET
+
+    def test_generic_host_profile_is_inferred_without_tree_sitter(self):
+        """Generic Host wiring infers the .NET profile."""
+        config = CodeCompressorConfig(
+            min_tokens_for_compression=10,
+            fallback_to_kompress=False,
+            enable_ccr=False,
+        )
+        compressor = CodeAwareCompressor(config)
+        code = """
+using Microsoft.Extensions.Hosting;
+
+var builder = Host.CreateApplicationBuilder(args);
+builder.Services.AddHostedService<Worker>();
+await builder.Build().RunAsync();
+
+public sealed class Worker : BackgroundService
+{
+    protected override Task ExecuteAsync(CancellationToken stoppingToken) => Task.CompletedTask;
+}
+"""
+
+        with patch(
+            "headroom.transforms.code_compressor._check_tree_sitter_available",
+            return_value=False,
+        ):
+            result = compressor.compress(code, language="csharp")
+
+        assert result.language == CodeLanguage.CSHARP
+        assert result.profile == CodeProfile.DOTNET
+
+    def test_efcore_migration_profile_preserves_schema_markers_without_tree_sitter(self):
+        """EF migrations infer EF Core profile from schema operations."""
+        config = CodeCompressorConfig(
+            min_tokens_for_compression=10,
+            fallback_to_kompress=False,
+            enable_ccr=False,
+        )
+        compressor = CodeAwareCompressor(config)
+        code = """
+using Microsoft.EntityFrameworkCore.Migrations;
+
+public partial class AddProducts : Migration
+{
+    protected override void Up(MigrationBuilder migrationBuilder)
+    {
+        migrationBuilder.CreateTable(name: "Products", columns: table => new
+        {
+            Id = table.Column<int>(nullable: false),
+            Name = table.Column<string>(nullable: false)
+        });
+        migrationBuilder.CreateIndex(name: "IX_Products_Name", table: "Products", column: "Name");
+    }
+}
+"""
+
+        with patch(
+            "headroom.transforms.code_compressor._check_tree_sitter_available",
+            return_value=False,
+        ):
+            result = compressor.compress(code, language="csharp")
+
+        assert result.language == CodeLanguage.CSHARP
+        assert result.profile == CodeProfile.EF_CORE
+
+    def test_appsettings_json_redacts_secret_values(self):
+        """ASP.NET Core appsettings JSON preserves shape and redacts secrets."""
+        compressor = CodeAwareCompressor(CodeCompressorConfig(min_tokens_for_compression=1))
+        code = """
+{
+    "ConnectionStrings": {
+        "DefaultConnection": "Server=.;Password=hunter2"
+    },
+    "Logging": {
+        "LogLevel": {
+            "Default": "Information"
+        }
+    },
+    "AllowedHosts": "*"
+}
+"""
+
+        result = compressor.compress(code, language="appsettings.json")
+
+        assert result.language == CodeLanguage.JSON
+        assert result.profile == CodeProfile.ASPNET_CORE
+        assert '"ConnectionStrings"' in result.compressed
+        assert "hunter2" not in result.compressed
+        assert '"DefaultConnection": ""' in result.compressed
+
+    def test_solution_artifact_preserves_project_lines(self):
+        """Solution files preserve project mappings."""
+        compressor = CodeAwareCompressor(CodeCompressorConfig(min_tokens_for_compression=1))
+        code = """
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "App", "App\\App.csproj", "{11111111-1111-1111-1111-111111111111}"
+EndProject
+Global
+        GlobalSection(SolutionConfigurationPlatforms) = preSolution
+                Debug|Any CPU = Debug|Any CPU
+        EndGlobalSection
+EndGlobal
+"""
+
+        result = compressor.compress(code, language="sln")
+
+        assert result.language == CodeLanguage.SOLUTION
+        assert result.profile == CodeProfile.DOTNET
+        assert "Project(" in result.compressed
+        assert "SolutionConfigurationPlatforms" in result.compressed
+
+    def test_slnx_artifact_preserves_project_elements(self):
+        """Solution XML files preserve project elements."""
+        compressor = CodeAwareCompressor(CodeCompressorConfig(min_tokens_for_compression=1))
+        code = """
+<Solution>
+    <Folder Name="src">
+        <Project Path="src/App/App.csproj" />
+    </Folder>
+    <Properties Name="Debug|Any CPU" />
+</Solution>
+"""
+
+        result = compressor.compress(code, language="slnx")
+
+        assert result.language == CodeLanguage.SOLUTION
+        assert result.profile == CodeProfile.DOTNET
+        assert '<Project Path="src/App/App.csproj" />' in result.compressed
+        assert "Properties" not in result.compressed
 
     def test_compress_auto_detects_python(self, compressor):
         """Python code is auto-detected during compression."""
@@ -476,6 +1038,186 @@ func main() {
 """
         result = compressor.compress(code)
         assert result.language in (CodeLanguage.GO, CodeLanguage.UNKNOWN)
+
+
+class TestAgentInformationRetention:
+    """Regression tests for information coding agents need after compression."""
+
+    def test_agent_context_preserves_csharp_api_and_behavior_decision_signals(self):
+        """Compressed classes keep API shape plus bounded behavior hints for agents."""
+        require_csharp_parser()
+        compressor = CodeAwareCompressor(
+            CodeCompressorConfig(
+                min_tokens_for_compression=1,
+                max_body_lines=1,
+                enable_ccr=False,
+            )
+        )
+        code = """
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+
+[ApiController]
+[Route("api/orders")]
+public sealed class OrdersController : ControllerBase
+{
+        private readonly IOrderService orders;
+
+        public OrdersController(IOrderService orders)
+        {
+                this.orders = orders;
+        }
+
+        [HttpGet("{id:guid}")]
+        [Authorize(Policy = "Orders.Read")]
+        public async Task<ActionResult<OrderDto>> GetAsync(Guid id, CancellationToken cancellationToken)
+        {
+                Validate(id);
+                var order = await orders.GetAsync(id, cancellationToken);
+                if (order is null)
+                {
+                        return NotFound();
+                }
+                return Ok(order);
+        }
+}
+"""
+
+        result = compressor.compress(code, language="aspnetcore")
+
+        assert result.syntax_valid is True
+        assert result.profile == CodeProfile.ASPNET_CORE
+        assert "[ApiController]" in result.compressed
+        assert '[Route("api/orders")]' in result.compressed
+        assert "public sealed class OrdersController : ControllerBase" in result.compressed
+        assert "private members" in result.compressed
+        assert "IOrderService orders" in result.compressed
+        assert "private readonly IOrderService orders;" not in result.compressed
+        assert "public OrdersController(IOrderService orders)" in result.compressed
+        assert '[HttpGet("{id:guid}")]' in result.compressed
+        assert '[Authorize(Policy = "Orders.Read")]' in result.compressed
+        assert (
+            "public async Task<ActionResult<OrderDto>> GetAsync(Guid id, "
+            "CancellationToken cancellationToken)" in result.compressed
+        )
+        assert "orders.GetAsync" in result.compressed
+        assert "NotFound" in result.compressed
+        assert "Ok" in result.compressed
+        assert "flow: branches" in result.compressed
+        assert "awaits" in result.compressed
+        assert "returns" in result.compressed
+
+    def test_agent_context_preserves_msbuild_dependency_decision_signals(self):
+        """Compressed project files keep frameworks and dependency edges."""
+        compressor = CodeAwareCompressor(CodeCompressorConfig(min_tokens_for_compression=1))
+        code = """
+<Project Sdk="Microsoft.NET.Sdk.Web">
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <Nullable>enable</Nullable>
+        <ImplicitUsings>enable</ImplicitUsings>
+    </PropertyGroup>
+    <ItemGroup>
+        <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" Version="10.0.0" />
+        <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.0" />
+        <ProjectReference Include="../Headroom.Domain/Headroom.Domain.csproj" />
+    </ItemGroup>
+</Project>
+"""
+
+        result = compressor.compress(code, language="csproj")
+
+        assert result.syntax_valid is True
+        assert result.language == CodeLanguage.MSBUILD
+        assert result.profile == CodeProfile.DOTNET
+        assert 'Sdk="Microsoft.NET.Sdk.Web"' in result.compressed
+        assert "<TargetFramework>net10.0</TargetFramework>" in result.compressed
+        assert 'Include="Microsoft.EntityFrameworkCore.SqlServer"' in result.compressed
+        assert 'Version="10.0.0"' in result.compressed
+        assert 'Include="Microsoft.AspNetCore.OpenApi"' in result.compressed
+        assert 'Include="../Headroom.Domain/Headroom.Domain.csproj"' in result.compressed
+
+    def test_agent_context_preserves_redacted_config_shape_for_decisions(self):
+        """Compressed appsettings keep configuration keys while removing secrets."""
+        compressor = CodeAwareCompressor(CodeCompressorConfig(min_tokens_for_compression=1))
+        code = """
+{
+    "ConnectionStrings": {
+        "DefaultConnection": "Server=localhost;Database=Headroom;User Id=sa;Password=SuperSecret!"
+    },
+    "Authentication": {
+        "Authority": "https://login.example.com/tenant",
+        "ClientSecret": "should-redact"
+    },
+    "Features": {
+        "EnableCompression": true
+    }
+}
+"""
+
+        result = compressor.compress(code, language="appsettings.json")
+
+        assert result.syntax_valid is True
+        assert result.language == CodeLanguage.JSON
+        assert result.profile == CodeProfile.ASPNET_CORE
+        assert '"ConnectionStrings"' in result.compressed
+        assert '"DefaultConnection": ""' in result.compressed
+        assert '"Authentication"' in result.compressed
+        assert '"Authority": "https://login.example.com/tenant"' in result.compressed
+        assert '"ClientSecret": ""' in result.compressed
+        assert '"EnableCompression": true' in result.compressed
+        assert "SuperSecret" not in result.compressed
+        assert "should-redact" not in result.compressed
+
+    def test_agent_context_preserves_workspace_and_unity_package_mappings(self):
+        """Compressed workspace artifacts keep project paths and package dependencies."""
+        compressor = CodeAwareCompressor(CodeCompressorConfig(min_tokens_for_compression=1))
+        solution = """
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Headroom.Api", "src/Headroom.Api/Headroom.Api.csproj", "{11111111-1111-1111-1111-111111111111}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Headroom.Domain", "src/Headroom.Domain/Headroom.Domain.csproj", "{22222222-2222-2222-2222-222222222222}"
+EndProject
+Global
+EndGlobal
+"""
+        manifest = """
+{
+    "dependencies": {
+        "com.unity.entities": "1.3.14",
+        "com.unity.burst": "1.8.18",
+        "com.company.private-tools": "file:../Packages/private-tools"
+    },
+    "scopedRegistries": [
+        { "name": "Company", "url": "https://packages.example.com", "scopes": ["com.company"] }
+    ]
+}
+"""
+
+        solution_result = compressor.compress(solution, language="sln")
+        manifest_result = compressor.compress(manifest, language="unity-manifest")
+
+        assert solution_result.syntax_valid is True
+        assert solution_result.language == CodeLanguage.SOLUTION
+        assert (
+            '"Headroom.Api", "src/Headroom.Api/Headroom.Api.csproj"' in solution_result.compressed
+        )
+        assert (
+            '"Headroom.Domain", "src/Headroom.Domain/Headroom.Domain.csproj"'
+            in solution_result.compressed
+        )
+        assert manifest_result.syntax_valid is True
+        assert manifest_result.language == CodeLanguage.JSON
+        assert manifest_result.profile == CodeProfile.UNITY
+        assert '"com.unity.entities": "1.3.14"' in manifest_result.compressed
+        assert '"com.unity.burst": "1.8.18"' in manifest_result.compressed
+        assert (
+            '"com.company.private-tools": "file:../Packages/private-tools"'
+            in manifest_result.compressed
+        )
+        assert '"url": "https://packages.example.com"' in manifest_result.compressed
+        assert '"com.company"' in manifest_result.compressed
 
 
 # =============================================================================
@@ -768,6 +1510,547 @@ class TestTreeSitterIntegration:
         assert result.syntax_valid is True
         assert result.language == CodeLanguage.GO
         assert result.compressed  # Some output is produced
+
+    def test_actual_csharp_compression(self):
+        """Test actual compression of C# class code."""
+        require_csharp_parser()
+        config = CodeCompressorConfig(
+            min_tokens_for_compression=10,
+            max_body_lines=2,
+            enable_ccr=False,
+        )
+        compressor = CodeAwareCompressor(config)
+        code = generate_csharp_code()
+
+        result = compressor.compress(code, language="csharp")
+
+        assert result.syntax_valid is True
+        assert result.language == CodeLanguage.CSHARP
+        assert result.profile == CodeProfile.GENERIC
+        assert "using System;" in result.compressed
+        assert "CustomerService" in result.compressed
+        assert "FormatName" in result.compressed
+
+    def test_csharp_14_source_syntax(self):
+        """C# 14 source syntax is treated as C# for .NET 10-era code."""
+        require_csharp_parser()
+        config = CodeCompressorConfig(
+            min_tokens_for_compression=10,
+            max_body_lines=3,
+            enable_ccr=False,
+        )
+        compressor = CodeAwareCompressor(config)
+        code = """
+using System;
+using System.Collections.Generic;
+
+public class Customer
+{
+    public string Message
+    {
+        get;
+        set => field = value ?? "";
+    }
+
+    public void Assign(Customer? other)
+    {
+        other?.Message = nameof(List<>);
+        var copy = other?.Message ?? "";
+        Console.WriteLine(copy);
+    }
+}
+"""
+
+        result = compressor.compress(code, language="c#")
+
+        assert result.language == CodeLanguage.CSHARP
+        assert result.profile == CodeProfile.DOTNET
+        assert result.syntax_valid is True
+        assert "Customer" in result.compressed
+        assert "nameof(List<>)" in result.compressed
+
+    def test_csharp_private_members_group_without_losing_public_interface(self):
+        """C# compression keeps the public interface and summarizes private dependencies."""
+        require_csharp_parser()
+        config = CodeCompressorConfig(
+            min_tokens_for_compression=1,
+            max_body_lines=1,
+            enable_ccr=False,
+        )
+        compressor = CodeAwareCompressor(config)
+        code = """
+using Microsoft.Extensions.Logging;
+
+public sealed class OrderService : IOrderService
+{
+    private readonly IOrderRepository repository;
+    private readonly ILogger<OrderService> logger;
+
+    public event EventHandler<OrderCreatedEventArgs>? OrderCreated;
+    public string Name { get; init; }
+
+    public async Task<OrderDto> CreateAsync(CreateOrder request)
+    {
+        Validate(request);
+        var entity = mapper.Map<Order>(request);
+        await repository.SaveAsync(entity);
+        logger.LogInformation("Created {Id}", entity.Id);
+        OrderCreated?.Invoke(this, new OrderCreatedEventArgs(entity.Id));
+        return mapper.Map<OrderDto>(entity);
+    }
+}
+"""
+
+        result = compressor.compress(code, language="csharp")
+
+        assert result.syntax_valid is True
+        assert "public sealed class OrderService : IOrderService" in result.compressed
+        assert "private members" in result.compressed
+        assert "IOrderRepository repository" in result.compressed
+        assert "ILogger<OrderService> logger" in result.compressed
+        assert "private readonly IOrderRepository repository;" not in result.compressed
+        assert (
+            "public event EventHandler<OrderCreatedEventArgs>? OrderCreated;" in result.compressed
+        )
+        assert "public string Name { get; init; }" in result.compressed
+        assert "public async Task<OrderDto> CreateAsync(CreateOrder request)" in result.compressed
+        assert "repository.SaveAsync" in result.compressed
+        assert "logger.LogInformation" in result.compressed
+        assert "OrderCreated.Invoke" in result.compressed
+        assert "awaits" in result.compressed
+        assert "returns" in result.compressed
+        assert "writes" in result.compressed
+
+    def test_csharp_omitted_comment_summarizes_control_flow(self):
+        """Omitted C# bodies include bounded behavior hints for control flow and throws."""
+        require_csharp_parser()
+        config = CodeCompressorConfig(
+            min_tokens_for_compression=1,
+            max_body_lines=1,
+            enable_ccr=False,
+        )
+        compressor = CodeAwareCompressor(config)
+        code = """
+public sealed class ReportBuilder
+{
+    public string Build(Customer customer)
+    {
+        Validate(customer);
+
+        foreach (var item in customer.Items)
+        {
+            if (item is null)
+            {
+                throw new InvalidOperationException("Missing item");
+            }
+            builder.AppendLine(item.Name);
+        }
+
+        return builder.ToString();
+    }
+}
+"""
+
+        result = compressor.compress(code, language="csharp")
+
+        assert result.syntax_valid is True
+        assert "public string Build(Customer customer)" in result.compressed
+        assert "lines omitted" in result.compressed
+        assert "flow:" in result.compressed
+        assert "loops" in result.compressed
+        assert "branches" in result.compressed
+        assert "throws" in result.compressed
+        assert "builder.AppendLine" in result.compressed
+
+    def test_unity_csharp_script_alias(self):
+        """Unity alias uses conservative C# support and preserves Unity entry points."""
+        require_csharp_parser()
+        config = CodeCompressorConfig(
+            min_tokens_for_compression=10,
+            max_body_lines=1,
+            enable_ccr=False,
+        )
+        compressor = CodeAwareCompressor(config)
+        code = """
+using System.Collections;
+using UnityEngine;
+
+[RequireComponent(typeof(Rigidbody))]
+public class PlayerController : MonoBehaviour
+{
+    [SerializeField] private Rigidbody body;
+    [field: SerializeField] public float Speed { get; private set; }
+
+    private void Awake()
+    {
+        body = GetComponent<Rigidbody>();
+    }
+
+    private IEnumerator Start()
+    {
+        yield return null;
+    }
+
+    private void Update()
+    {
+        transform.Translate(Vector3.forward * Speed * Time.deltaTime);
+    }
+
+#if UNITY_EDITOR
+    private void OnValidate()
+    {
+        Speed = Mathf.Max(0, Speed);
+    }
+#endif
+}
+"""
+
+        result = compressor.compress(code, language="unity")
+
+        assert result.language == CodeLanguage.CSHARP
+        assert result.profile == CodeProfile.UNITY
+        assert result.syntax_valid is True
+        assert "using UnityEngine;" in result.compressed
+        assert "[RequireComponent" in result.compressed
+        assert "unity serialized fields" in result.compressed
+        assert "Rigidbody body" in result.compressed
+        assert "float Speed" in result.compressed
+        assert "Awake" in result.compressed
+        assert "Start" in result.compressed
+        assert "Update" in result.compressed
+        assert "#if UNITY_EDITOR" in result.compressed
+        assert "OnValidate" in result.compressed
+
+    def test_aspnet_core_alias_and_attributes(self):
+        """ASP.NET Core alias maps to C# and preserves route/action metadata."""
+        require_csharp_parser()
+        config = CodeCompressorConfig(
+            min_tokens_for_compression=10,
+            max_body_lines=2,
+            enable_ccr=False,
+        )
+        compressor = CodeAwareCompressor(config)
+        code = """
+using Microsoft.AspNetCore.Mvc;
+
+[ApiController]
+[Route("api/[controller]")]
+public class WeatherController : ControllerBase
+{
+    [HttpGet]
+    public IActionResult Get()
+    {
+        var forecast = new[] { "sunny", "cloudy", "rain" };
+        var selected = forecast[DateTime.UtcNow.Day % forecast.Length];
+        return Ok(new { forecast = selected });
+    }
+}
+"""
+
+        result = compressor.compress(code, language="asp.net core")
+
+        assert result.language == CodeLanguage.CSHARP
+        assert result.profile == CodeProfile.ASPNET_CORE
+        assert result.syntax_valid is True
+        assert "[ApiController]" in result.compressed
+        assert "[HttpGet]" in result.compressed
+        assert "IActionResult Get" in result.compressed
+
+    def test_aspnet_core_minimal_api_source(self):
+        """ASP.NET Core minimal API source remains valid C# top-level code."""
+        require_csharp_parser()
+        config = CodeCompressorConfig(
+            min_tokens_for_compression=10,
+            enable_ccr=False,
+        )
+        compressor = CodeAwareCompressor(config)
+        code = """
+using System.ComponentModel.DataAnnotations;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.HttpResults;
+
+var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddValidation();
+builder.Services.AddOpenApi();
+
+var app = builder.Build();
+
+app.MapPost("/products", ([Required] Product product) =>
+    TypedResults.Ok(product))
+   .WithName("CreateProduct")
+   .WithOpenApi();
+
+app.MapGet("/events", () =>
+    TypedResults.ServerSentEvents(GetEventsAsync()));
+
+app.MapOpenApi("/openapi/{documentName}.yaml");
+app.Run();
+
+public record Product([Required] string Name, [Range(1, 1000)] int Quantity);
+"""
+
+        result = compressor.compress(code, language="aspnetcore")
+
+        assert result.language == CodeLanguage.CSHARP
+        assert result.profile == CodeProfile.ASPNET_CORE
+        assert result.syntax_valid is True
+        assert "WebApplication.CreateBuilder" in result.compressed
+        assert "AddValidation" in result.compressed
+        assert "AddOpenApi" in result.compressed
+        assert "aspnet: MapPost" in result.compressed
+        assert 'route="/products"' in result.compressed
+        assert 'name="CreateProduct"' in result.compressed
+        assert "WithOpenApi" in result.compressed
+        assert "aspnet: MapGet" in result.compressed
+        assert 'route="/events"' in result.compressed
+        assert "MapOpenApi" in result.compressed
+        assert "[Required]" in result.compressed
+
+    def test_unity_entities_query_body_is_summarized(self):
+        """Unity DOTS query loops are summarized instead of fully preserved."""
+        require_csharp_parser()
+        config = CodeCompressorConfig(
+            min_tokens_for_compression=10,
+            max_body_lines=1,
+            enable_ccr=False,
+        )
+        compressor = CodeAwareCompressor(config)
+        code = """
+using Unity.Burst;
+using Unity.Entities;
+using Unity.Mathematics;
+using Unity.Transforms;
+
+public struct MoveSpeed : IComponentData
+{
+    public float Value;
+}
+
+[BurstCompile]
+public partial struct MoveSystem : ISystem
+{
+    public void OnUpdate(ref SystemState state)
+    {
+        foreach (var (transform, speed) in SystemAPI.Query<RefRW<LocalTransform>, RefRO<MoveSpeed>>())
+        {
+            float3 direction = new float3(1, 0, 0);
+            transform.ValueRW.Position += direction * speed.ValueRO.Value * SystemAPI.Time.DeltaTime;
+        }
+    }
+}
+"""
+
+        result = compressor.compress(code, language="unity")
+
+        assert result.syntax_valid is True
+        assert result.compression_ratio < 1.0
+        assert "unity-entities: SystemAPI.Query" in result.compressed
+        assert "direction * speed" not in result.compressed
+
+    def test_unity_serialized_fields_are_grouped(self):
+        """Unity serialized field blocks collapse to a compact schema summary."""
+        require_csharp_parser()
+        config = CodeCompressorConfig(
+            min_tokens_for_compression=10,
+            max_body_lines=1,
+            enable_ccr=False,
+        )
+        compressor = CodeAwareCompressor(config)
+        code = """
+using UnityEngine;
+
+public class PlayerController : MonoBehaviour
+{
+    [Header("Movement")]
+    [SerializeField] private Rigidbody body;
+    [SerializeField] private Transform cameraPivot;
+    [SerializeField] private float speed = 7.5f;
+    [SerializeField] private float jumpForce = 8f;
+    private Vector3 input;
+    private bool grounded;
+}
+"""
+
+        result = compressor.compress(code, language="unity")
+
+        assert result.syntax_valid is True
+        assert "unity serialized fields" in result.compressed
+        assert "Rigidbody body" in result.compressed
+        assert "Transform cameraPivot" in result.compressed
+        assert "Header" not in result.compressed
+
+    def test_dots_component_fields_are_grouped(self):
+        """DOTS component fields are summarized as a schema."""
+        require_csharp_parser()
+        compressor = CodeAwareCompressor(
+            CodeCompressorConfig(min_tokens_for_compression=1, enable_ccr=False)
+        )
+        code = """
+using Unity.Entities;
+
+public struct MoveSpeed : IComponentData
+{
+    public float Value;
+    public float Acceleration;
+    public float MaxSpeed;
+}
+"""
+
+        result = compressor.compress(code, language="unity")
+
+        assert result.syntax_valid is True
+        assert "unity-dots schema" in result.compressed
+        assert "float Value" in result.compressed
+        assert "public float Acceleration;" not in result.compressed
+
+    def test_one_line_unity_entities_struct_is_not_duplicated(self):
+        """One-line ECS data structs are preserved once, not once per child node."""
+        require_csharp_parser()
+        compressor = CodeAwareCompressor(
+            CodeCompressorConfig(min_tokens_for_compression=1, enable_ccr=False)
+        )
+        code = """
+using Unity.Entities;
+
+public struct MoveSpeed : IComponentData { public float Value; public float Acceleration; }
+"""
+
+        result = compressor.compress(code, language="unity")
+
+        assert result.syntax_valid is True
+        assert result.compressed.count("public struct MoveSpeed") == 1
+
+    def test_efcore_migration_operations_are_summarized(self):
+        """EF migration operations are summarized with schema names preserved."""
+        require_csharp_parser()
+        config = CodeCompressorConfig(
+            min_tokens_for_compression=10,
+            max_body_lines=1,
+            enable_ccr=False,
+        )
+        compressor = CodeAwareCompressor(config)
+        code = """
+using Microsoft.EntityFrameworkCore.Migrations;
+
+public partial class AddProducts : Migration
+{
+    protected override void Up(MigrationBuilder migrationBuilder)
+    {
+        migrationBuilder.CreateTable(
+            name: "Products",
+            columns: table => new
+            {
+                Id = table.Column<int>(nullable: false),
+                Name = table.Column<string>(maxLength: 200, nullable: false)
+            });
+        migrationBuilder.CreateIndex(
+            name: "IX_Products_Name",
+            table: "Products",
+            column: "Name");
+    }
+}
+"""
+
+        result = compressor.compress(code, language="efcore")
+
+        assert result.syntax_valid is True
+        assert result.compression_ratio < 0.9
+        assert "efcore: CreateTable" in result.compressed
+        assert "name=Products" in result.compressed
+        assert "table.Column<string>" not in result.compressed
+
+    def test_efcore_dbsets_are_grouped(self):
+        """DbContext DbSet properties collapse into a compact schema summary."""
+        require_csharp_parser()
+        compressor = CodeAwareCompressor(
+            CodeCompressorConfig(min_tokens_for_compression=1, enable_ccr=False)
+        )
+        code = """
+using Microsoft.EntityFrameworkCore;
+
+public sealed class AppDbContext : DbContext
+{
+    public DbSet<Product> Products => Set<Product>();
+    public DbSet<Order> Orders => Set<Order>();
+    public DbSet<Customer> Customers => Set<Customer>();
+}
+"""
+
+        result = compressor.compress(code, language="efcore")
+
+        assert result.syntax_valid is True
+        assert "efcore dbsets" in result.compressed
+        assert "DbSet<Product> Products" in result.compressed
+        assert "public DbSet<Order> Orders" not in result.compressed
+
+    def test_multiline_minimal_api_endpoint_is_summarized(self):
+        """Multiline Minimal API handlers keep route metadata but omit handler body."""
+        require_csharp_parser()
+        config = CodeCompressorConfig(
+            min_tokens_for_compression=10,
+            max_body_lines=1,
+            enable_ccr=False,
+        )
+        compressor = CodeAwareCompressor(config)
+        code = """
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http.HttpResults;
+
+var builder = WebApplication.CreateBuilder(args);
+var app = builder.Build();
+
+app.MapPost("/products", (Product product) =>
+    {
+        var normalized = product.Name.Trim().ToUpperInvariant();
+        var response = product with { Name = normalized };
+        return TypedResults.Ok(response);
+    })
+   .WithName("CreateProduct")
+   .WithOpenApi();
+
+public record Product(string Name);
+"""
+
+        result = compressor.compress(code, language="aspnetcore")
+
+        assert result.syntax_valid is True
+        assert result.compression_ratio < 1.0
+        assert "aspnet: MapPost" in result.compressed
+        assert 'route="/products"' in result.compressed
+        assert "normalized" not in result.compressed
+
+    def test_dotnet_worker_large_loop_body_can_be_omitted(self):
+        """A single large loop statement should not force the whole method body to stay."""
+        require_csharp_parser()
+        config = CodeCompressorConfig(
+            min_tokens_for_compression=10,
+            max_body_lines=1,
+            enable_ccr=False,
+        )
+        compressor = CodeAwareCompressor(config)
+        code = """
+using Microsoft.Extensions.Hosting;
+
+public sealed class Worker : BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            Console.WriteLine("tick");
+            await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+        }
+    }
+}
+"""
+
+        result = compressor.compress(code, language="csharp")
+
+        assert result.syntax_valid is True
+        assert result.compression_ratio < 1.0
+        assert 'Console.WriteLine("tick")' not in result.compressed
+        assert "lines omitted" in result.compressed
 
     def test_imports_preserved(self):
         """Imports are preserved in compressed output."""

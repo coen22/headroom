@@ -4,10 +4,12 @@ from headroom.transforms.content_detector import (
     ContentType,
     _try_detect_code,
     _try_detect_diff,
+    _try_detect_dotnet_artifact,
     _try_detect_html,
     _try_detect_json,
     _try_detect_log,
     _try_detect_search,
+    _try_detect_xml_log,
     detect_content_type,
     is_json_array_of_dicts,
 )
@@ -166,6 +168,294 @@ def test_code_detection_identifies_language_and_thresholds() -> None:
     assert _try_detect_code("function maybe() {}\nplain text") is None
     assert _try_detect_code("import os\ndef main():") is None
     assert _try_detect_code("\n\n") is None
+
+
+def test_code_detection_identifies_csharp_source() -> None:
+    csharp_code = "\n".join(
+        [
+            "using Microsoft.AspNetCore.Builder;",
+            "using Microsoft.AspNetCore.Http;",
+            "",
+            "var builder = WebApplication.CreateBuilder(args);",
+            "var app = builder.Build();",
+            'app.MapGet("/health", () => Results.Ok());',
+        ]
+    )
+
+    result = _try_detect_code(csharp_code)
+
+    assert result is not None
+    assert result.content_type is ContentType.SOURCE_CODE
+    assert result.metadata == {
+        "language": "csharp",
+        "pattern_matches": 4,
+        "profile": "aspnetcore",
+    }
+    assert detect_content_type(csharp_code).content_type is ContentType.SOURCE_CODE
+
+
+def test_code_detection_identifies_efcore_profile() -> None:
+    csharp_code = "\n".join(
+        [
+            "using Microsoft.EntityFrameworkCore;",
+            "public class AppDbContext : DbContext",
+            "{",
+            "    public DbSet<Product> Products => Set<Product>();",
+            "    protected override void OnModelCreating(ModelBuilder modelBuilder) {}",
+            "}",
+        ]
+    )
+
+    result = _try_detect_code(csharp_code)
+
+    assert result is not None
+    assert result.metadata["language"] == "csharp"
+    assert result.metadata["profile"] == "efcore"
+
+
+def test_code_detection_identifies_unity_entities_profile() -> None:
+    csharp_code = "\n".join(
+        [
+            "using Unity.Entities;",
+            "public struct MoveSpeed : IComponentData",
+            "{",
+            "    public float Value;",
+            "}",
+            "public partial struct MoveSystem : ISystem",
+            "{",
+            "    public void OnUpdate(ref SystemState state) => SystemAPI.Query<MoveSpeed>();",
+            "}",
+        ]
+    )
+
+    result = _try_detect_code(csharp_code)
+
+    assert result is not None
+    assert result.metadata["language"] == "csharp"
+    assert result.metadata["profile"] == "unity"
+
+
+def test_code_detection_identifies_burst_profile() -> None:
+    csharp_code = "\n".join(
+        [
+            "using Unity.Burst;",
+            "[BurstCompile]",
+            "public struct IntegrateJob",
+            "{",
+            "    public void Execute() {}",
+            "}",
+        ]
+    )
+
+    result = _try_detect_code(csharp_code)
+
+    assert result is not None
+    assert result.metadata["language"] == "csharp"
+    assert result.metadata["profile"] == "unity"
+
+
+def test_code_detection_identifies_dotnet_console_profile() -> None:
+    csharp_code = "\n".join(
+        [
+            'Console.WriteLine("Hello, Headroom!");',
+            "var name = Console.ReadLine();",
+            'Console.WriteLine($"Hello {name}");',
+        ]
+    )
+
+    result = _try_detect_code(csharp_code)
+
+    assert result is not None
+    assert result.metadata["language"] == "csharp"
+    assert result.metadata["profile"] == "dotnet"
+
+
+def test_code_detection_identifies_single_line_dotnet_console_program() -> None:
+    result = _try_detect_code('Console.WriteLine("Hello, World!");')
+
+    assert result is not None
+    assert result.content_type is ContentType.SOURCE_CODE
+    assert result.metadata["language"] == "csharp"
+    assert result.metadata["profile"] == "dotnet"
+
+
+def test_code_detection_identifies_generic_host_profile() -> None:
+    csharp_code = "\n".join(
+        [
+            "using Microsoft.Extensions.Hosting;",
+            "var builder = Host.CreateApplicationBuilder(args);",
+            "builder.Services.AddHostedService<Worker>();",
+            "await builder.Build().RunAsync();",
+        ]
+    )
+
+    result = _try_detect_code(csharp_code)
+
+    assert result is not None
+    assert result.metadata["language"] == "csharp"
+    assert result.metadata["profile"] == "dotnet"
+
+
+def test_dotnet_artifact_detection_identifies_msbuild_razor_and_solution() -> None:
+    csproj = """
+<Project Sdk="Microsoft.NET.Sdk.Web">
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+    </PropertyGroup>
+    <ItemGroup>
+        <PackageReference Include="Microsoft.EntityFrameworkCore" Version="10.0.0" />
+    </ItemGroup>
+</Project>
+"""
+    razor = """
+@page "/products"
+@inject ProductService Products
+
+<h1>Products</h1>
+
+@code {
+        [PersistentState] public Product? Product { get; set; }
+}
+"""
+    solution = """
+Microsoft Visual Studio Solution File, Format Version 12.00
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "App", "App\\App.csproj", "{11111111-1111-1111-1111-111111111111}"
+EndProject
+"""
+
+    csproj_result = _try_detect_dotnet_artifact(csproj)
+    razor_result = _try_detect_dotnet_artifact(razor)
+    solution_result = _try_detect_dotnet_artifact(solution)
+
+    assert csproj_result is not None
+    assert csproj_result.metadata == {
+        "language": "msbuild",
+        "profile": "aspnetcore",
+        "artifact": "msbuild",
+    }
+    assert razor_result is not None
+    assert razor_result.metadata == {
+        "language": "razor",
+        "profile": "aspnetcore",
+        "artifact": "razor",
+    }
+    assert solution_result is not None
+    assert solution_result.metadata == {
+        "language": "solution",
+        "profile": "dotnet",
+        "artifact": "sln",
+    }
+
+
+def test_dotnet_artifact_detection_identifies_unity_and_appsettings_json() -> None:
+    asmdef = """
+{
+    "name": "Game.Runtime",
+    "references": ["Unity.TextMeshPro"],
+    "includePlatforms": [],
+    "allowUnsafeCode": false
+}
+"""
+    appsettings = """
+{
+    "ConnectionStrings": {
+        "DefaultConnection": "Server=.;Password=hunter2"
+    },
+    "Logging": {
+        "LogLevel": {
+            "Default": "Information"
+        }
+    },
+    "AllowedHosts": "*"
+}
+"""
+
+    asmdef_result = _try_detect_dotnet_artifact(asmdef)
+    appsettings_result = _try_detect_dotnet_artifact(appsettings)
+
+    assert asmdef_result is not None
+    assert asmdef_result.metadata == {
+        "language": "json",
+        "profile": "unity",
+        "artifact": "unity-asmdef",
+    }
+    assert appsettings_result is not None
+    assert appsettings_result.metadata == {
+        "language": "json",
+        "profile": "aspnetcore",
+        "artifact": "appsettings",
+    }
+
+
+def test_dotnet_artifact_detection_identifies_unity_package_manifest() -> None:
+    manifest = """
+{
+    "dependencies": {
+        "com.unity.entities": "1.3.14",
+        "com.unity.collections": "2.5.1"
+    },
+    "scopedRegistries": [
+        { "name": "Unity", "url": "https://packages.unity.com", "scopes": ["com.unity"] }
+    ]
+}
+"""
+
+    result = _try_detect_dotnet_artifact(manifest)
+
+    assert result is not None
+    assert result.metadata == {
+        "language": "json",
+        "profile": "unity",
+        "artifact": "unity-package",
+    }
+
+
+def test_xml_log_detection_identifies_unity_nunit_report() -> None:
+    report = """
+<?xml version="1.0" encoding="utf-8"?>
+<test-run testcasecount="2" result="Failed">
+    <test-suite type="Assembly" result="Failed" fullname="Game.Tests">
+        <test-case fullname="MovementTests.Moves" result="Passed" />
+        <test-case fullname="MovementTests.Throws" result="Failed">
+            <failure>
+                <message>Expected position to change</message>
+                <stack-trace>at MovementTests.Throws() in Assets/Tests/MovementTests.cs:line 42</stack-trace>
+            </failure>
+        </test-case>
+    </test-suite>
+</test-run>
+"""
+
+    result = _try_detect_xml_log(report)
+
+    assert result is not None
+    assert result.content_type is ContentType.BUILD_OUTPUT
+    assert result.metadata == {
+        "format": "nunit-xml",
+        "profile": "unity",
+        "artifact": "test-report",
+    }
+
+
+def test_xml_log_detection_identifies_unity_editor_log_xml() -> None:
+    log = """
+<?xml version="1.0"?>
+<log>
+    <entry level="Error">MCP-FOR-UNITY: Client handler error</entry>
+    <entry>Library/PackageCache/com.unity.entities/Unity.Entities.csproj</entry>
+    <entry>(Filename: Assets/Scripts/System.cs Line: 17)</entry>
+</log>
+"""
+
+    result = _try_detect_xml_log(log)
+
+    assert result is not None
+    assert result.content_type is ContentType.BUILD_OUTPUT
+    assert result.metadata == {
+        "format": "unity-xml-log",
+        "profile": "unity",
+        "artifact": "unity-log",
+    }
 
 
 def test_detect_content_type_respects_priority_order() -> None:

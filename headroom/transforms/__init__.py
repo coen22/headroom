@@ -23,6 +23,7 @@ if TYPE_CHECKING:
         CodeCompressionResult,
         CodeCompressorConfig,
         CodeLanguage,
+        CodeProfile,
         DocstringMode,
         detect_language,
         is_tree_sitter_available,
@@ -96,6 +97,7 @@ __all__ = [
     "CodeCompressorConfig",
     "CodeCompressionResult",
     "CodeLanguage",
+    "CodeProfile",
     "DocstringMode",
     "detect_language",
     "is_tree_sitter_available",
@@ -168,6 +170,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
         "CodeCompressionResult",
     ),
     "CodeLanguage": ("headroom.transforms.code_compressor", "CodeLanguage"),
+    "CodeProfile": ("headroom.transforms.code_compressor", "CodeProfile"),
     "DocstringMode": ("headroom.transforms.code_compressor", "DocstringMode"),
     "detect_language": ("headroom.transforms.code_compressor", "detect_language"),
     "is_tree_sitter_available": (

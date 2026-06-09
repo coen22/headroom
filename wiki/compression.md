@@ -215,6 +215,8 @@ def process_data(items: List[str]) -> Dict[str, int]:
 | Java | tree-sitter | Full AST |
 | C | tree-sitter | Full AST |
 | C++ | tree-sitter | Full AST |
+| C# | tree-sitter | Full AST with generic, dotnet, aspnetcore, efcore, and unity profiles |
+| Razor / MSBuild / solution / Unity metadata | lightweight parsers | Conservative structure preservation |
 
 ---
 

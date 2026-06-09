@@ -6,7 +6,7 @@ produce many other formats that need specialized handling.
 
 Supported content types:
 - JSON_ARRAY: Structured JSON data (existing SmartCrusher)
-- SOURCE_CODE: Python, JavaScript, TypeScript, Go, etc.
+- SOURCE_CODE: Python, JavaScript, TypeScript, Go, C#, etc.
 - SEARCH_RESULTS: grep/ripgrep output (file:line:content)
 - BUILD_OUTPUT: Compiler, test, lint logs
 - GIT_DIFF: Unified diff format
@@ -25,7 +25,7 @@ class ContentType(Enum):
     """Types of content that can be compressed."""
 
     JSON_ARRAY = "json_array"  # Existing SmartCrusher handles this
-    SOURCE_CODE = "source_code"  # Python, JS, TS, Go, Rust, etc.
+    SOURCE_CODE = "source_code"  # Python, JS, TS, Go, Rust, C#, etc.
     SEARCH_RESULTS = "search"  # grep/ripgrep output
     BUILD_OUTPUT = "build"  # Compiler, test, lint logs
     GIT_DIFF = "diff"  # Unified diff format
@@ -95,7 +95,42 @@ _CODE_PATTERNS = {
         re.compile(r"^\s*@\w+"),  # annotations
         re.compile(r"^\s*package\s+[\w.]+;"),
     ],
+    "csharp": [
+        re.compile(r"^\s*using\s+(static\s+)?(\w+\s*=\s*)?[\w.<>]+;"),
+        re.compile(r"^\s*namespace\s+[\w.]+(\s*;|\s*\{)"),
+        re.compile(r"^\s*\[[A-Za-z][\w.]*(\([^\]]*\))?\]"),
+        re.compile(
+            r"^\s*(public|private|protected|internal|sealed|abstract|partial|static|unsafe|"
+            r"readonly|ref)\s+.*\b(class|struct|record|interface|enum|delegate)\b"
+        ),
+        re.compile(
+            r"^\s*(public|private|protected|internal|static|async|override|virtual|sealed|"
+            r"partial|unsafe)\s+.*\b(Task|ValueTask|IActionResult|ActionResult|void|string|"
+            r"int|bool)\b\s+\w+\s*\("
+        ),
+        re.compile(r"^\s*var\s+\w+\s*=\s*WebApplication\.CreateBuilder\("),
+        re.compile(r"^\s*\w+\.Map(Get|Post|Put|Delete|Patch)\("),
+        re.compile(
+            r".*\b(MonoBehaviour|UnityEngine|SerializeField|ControllerBase|WebApplication|"
+            r"IActionResult|Unity\.Entities|IComponentData|IBufferElementData|"
+            r"ISharedComponentData|IEnableableComponent|ISystem|SystemBase|SystemAPI|"
+            r"EntityManager|Baker<|IAspect|IJobEntity|Unity\.Burst|BurstCompile|"
+            r"Console\.WriteLine|Console\.Read|Host\.CreateApplicationBuilder|"
+            r"Host\.CreateDefaultBuilder|IHostedService|BackgroundService)\b"
+        ),
+    ],
 }
+
+_STRONG_CSHARP_SIGNALS = re.compile(
+    r"\b("
+    r"Console\.(Write|WriteLine|Read|ReadLine)|"
+    r"Host\.Create(ApplicationBuilder|DefaultBuilder)|"
+    r"WebApplication\.CreateBuilder|"
+    r"Unity\.Burst|BurstCompile|Unity\.Entities|"
+    r"IComponentData|ISystem|SystemAPI|EntityManager|"
+    r"DbContext|DbSet<|MigrationBuilder"
+    r")\b"
+)
 
 # Log/build output patterns
 _LOG_PATTERNS = [
@@ -144,27 +179,37 @@ def detect_content_type(content: str) -> DetectionResult:
     if diff_result and diff_result.confidence >= 0.7:
         return diff_result
 
-    # 3. Check for HTML (very distinctive, needs extraction not compression)
+    # 3. Check for .NET/Unity metadata artifacts before HTML/plain text routing.
+    artifact_result = _try_detect_dotnet_artifact(content)
+    if artifact_result and artifact_result.confidence >= 0.6:
+        return artifact_result
+
+    # 4. Check for Unity/editor XML logs and test reports before generic HTML routing.
+    xml_log_result = _try_detect_xml_log(content)
+    if xml_log_result and xml_log_result.confidence >= 0.6:
+        return xml_log_result
+
+    # 5. Check for HTML (very distinctive, needs extraction not compression)
     html_result = _try_detect_html(content)
     if html_result and html_result.confidence >= 0.7:
         return html_result
 
-    # 4. Check for search results (file:line: format)
+    # 6. Check for search results (file:line: format)
     search_result = _try_detect_search(content)
     if search_result and search_result.confidence >= 0.6:
         return search_result
 
-    # 5. Check for build/log output
+    # 7. Check for build/log output
     log_result = _try_detect_log(content)
     if log_result and log_result.confidence >= 0.5:
         return log_result
 
-    # 6. Check for source code
+    # 8. Check for source code
     code_result = _try_detect_code(content)
     if code_result and code_result.confidence >= 0.5:
         return code_result
 
-    # 7. Fallback to plain text
+    # 9. Fallback to plain text
     return DetectionResult(ContentType.PLAIN_TEXT, 0.5, {})
 
 
@@ -194,6 +239,158 @@ def _try_detect_json(content: str) -> DetectionResult | None:
             )
     except json.JSONDecodeError:
         pass
+
+    return None
+
+
+def _try_detect_dotnet_artifact(content: str) -> DetectionResult | None:
+    """Detect .NET, ASP.NET Core, Unity, Razor, and solution metadata files."""
+    stripped = content.strip()
+    sample = stripped[:5000]
+    if not stripped:
+        return None
+
+    if re.search(
+        r"^\s*@(page|route|model|using|inject|implements|inherits|layout|rendermode)\b",
+        sample,
+        re.MULTILINE,
+    ) or re.search(r"^\s*@(code|functions)\s*\{", sample, re.MULTILINE):
+        return DetectionResult(
+            ContentType.SOURCE_CODE,
+            0.85,
+            {"language": "razor", "profile": "aspnetcore", "artifact": "razor"},
+        )
+
+    if re.search(r"^\s*<Project\b", sample) or any(
+        marker in sample
+        for marker in ("<TargetFramework", "<PackageReference", "<ProjectReference")
+    ):
+        profile = "aspnetcore" if "Microsoft.NET.Sdk.Web" in sample else "dotnet"
+        return DetectionResult(
+            ContentType.SOURCE_CODE,
+            0.9,
+            {"language": "msbuild", "profile": profile, "artifact": "msbuild"},
+        )
+
+    if stripped.startswith("Microsoft Visual Studio Solution File") or re.search(
+        r"^\s*Project\(\"\{", sample, re.MULTILINE
+    ):
+        return DetectionResult(
+            ContentType.SOURCE_CODE,
+            0.9,
+            {"language": "solution", "profile": "dotnet", "artifact": "sln"},
+        )
+
+    if re.search(r"^\s*<Solution\b", sample):
+        return DetectionResult(
+            ContentType.SOURCE_CODE,
+            0.8,
+            {"language": "solution", "profile": "dotnet", "artifact": "slnx"},
+        )
+
+    if stripped.startswith("{"):
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+
+        keys = {str(key).lower() for key in parsed}
+        dependencies = parsed.get("dependencies")
+        dependency_names = set(dependencies) if isinstance(dependencies, dict) else set()
+        package_name = str(parsed.get("name", ""))
+        if (
+            package_name.startswith("com.unity.")
+            or any(str(name).startswith("com.unity.") for name in dependency_names)
+            or "scopedregistries" in keys
+            or "testables" in keys
+        ):
+            return DetectionResult(
+                ContentType.SOURCE_CODE,
+                0.85,
+                {"language": "json", "profile": "unity", "artifact": "unity-package"},
+            )
+
+        unity_keys = {
+            "name",
+            "references",
+            "includeplatforms",
+            "excludeplatforms",
+            "defineconstraints",
+            "versiondefines",
+            "autoReferenced".lower(),
+        }
+        if "name" in keys and len(keys & unity_keys) >= 2:
+            return DetectionResult(
+                ContentType.SOURCE_CODE,
+                0.85,
+                {"language": "json", "profile": "unity", "artifact": "unity-asmdef"},
+            )
+
+        if "profiles" in keys:
+            return DetectionResult(
+                ContentType.SOURCE_CODE,
+                0.8,
+                {"language": "json", "profile": "aspnetcore", "artifact": "launchsettings"},
+            )
+
+        if keys & {"logging", "connectionstrings", "allowedhosts", "kestrel"}:
+            return DetectionResult(
+                ContentType.SOURCE_CODE,
+                0.8,
+                {"language": "json", "profile": "aspnetcore", "artifact": "appsettings"},
+            )
+
+        if "sdk" in keys:
+            return DetectionResult(
+                ContentType.SOURCE_CODE,
+                0.75,
+                {"language": "json", "profile": "dotnet", "artifact": "globaljson"},
+            )
+
+    return None
+
+
+def _try_detect_xml_log(content: str) -> DetectionResult | None:
+    """Detect XML-shaped Unity, NUnit, and JUnit logs/test reports."""
+    sample = content.strip()[:8000]
+    if not sample.startswith("<") and "<?xml" not in sample[:100]:
+        return None
+
+    lower = sample.lower()
+    if any(marker in lower for marker in ("<test-run", "<test-suite", "<test-case")):
+        return DetectionResult(
+            ContentType.BUILD_OUTPUT,
+            0.9,
+            {"format": "nunit-xml", "profile": "unity", "artifact": "test-report"},
+        )
+
+    if any(marker in lower for marker in ("<testsuites", "<testsuite", "<testcase")):
+        return DetectionResult(
+            ContentType.BUILD_OUTPUT,
+            0.9,
+            {"format": "junit-xml", "profile": "unity", "artifact": "test-report"},
+        )
+
+    if any(
+        marker in sample
+        for marker in (
+            "UnityEngine.",
+            "UnityEditor.",
+            "[Package Manager]",
+            "MCP-FOR-UNITY",
+            "Library/PackageCache",
+            "Filename:",
+            "Editor.log",
+            "Player.log",
+        )
+    ):
+        return DetectionResult(
+            ContentType.BUILD_OUTPUT,
+            0.8,
+            {"format": "unity-xml-log", "profile": "unity", "artifact": "unity-log"},
+        )
 
     return None
 
@@ -404,18 +601,107 @@ def _try_detect_code(content: str) -> DetectionResult | None:
 
     # Need at least 3 pattern matches to be confident
     if best_score < 3:
-        return None
+        if best_lang != "csharp" or not _STRONG_CSHARP_SIGNALS.search(content):
+            return None
 
     non_empty_lines = sum(1 for line in lines if line.strip())
     ratio = best_score / max(non_empty_lines, 1)
 
     confidence = min(1.0, 0.4 + (ratio * 0.4) + (best_score * 0.02))
 
-    return DetectionResult(
-        ContentType.SOURCE_CODE,
-        confidence,
-        {"language": best_lang, "pattern_matches": best_score},
-    )
+    metadata = {"language": best_lang, "pattern_matches": best_score}
+    if best_lang == "csharp":
+        metadata["profile"] = _detect_csharp_profile(content)
+
+    return DetectionResult(ContentType.SOURCE_CODE, confidence, metadata)
+
+
+def _detect_csharp_profile(content: str) -> str:
+    """Infer a lightweight C# framework/runtime profile for routing metadata."""
+    if any(
+        marker in content
+        for marker in (
+            "using UnityEngine;",
+            "using UnityEditor;",
+            "using Unity.Burst;",
+            "using Unity.Entities;",
+            "Unity.Burst",
+            "Unity.Entities",
+            "com.unity.entities",
+            "MonoBehaviour",
+            "ScriptableObject",
+            "IComponentData",
+            "IBufferElementData",
+            "ISharedComponentData",
+            "IEnableableComponent",
+            "ISystem",
+            "SystemBase",
+            "SystemAPI",
+            "EntityManager",
+            "Baker<",
+            "IAspect",
+            "IJobEntity",
+            "BurstCompile",
+            "UNITY_",
+        )
+    ):
+        return "unity"
+
+    if any(
+        marker in content
+        for marker in (
+            "Console.WriteLine",
+            "Console.Read",
+            "Host.CreateApplicationBuilder",
+            "Host.CreateDefaultBuilder",
+            "IHostedService",
+            "BackgroundService",
+        )
+    ):
+        return "dotnet"
+
+    if any(
+        marker in content
+        for marker in (
+            "Microsoft.AspNetCore",
+            "WebApplication.CreateBuilder",
+            "ControllerBase",
+            "IActionResult",
+            "TypedResults",
+            "MapGet(",
+            "MapPost(",
+            "AddOpenApi",
+            "AddValidation",
+            "[ApiController]",
+        )
+    ):
+        return "aspnetcore"
+
+    if any(
+        marker in content
+        for marker in (
+            "Microsoft.EntityFrameworkCore",
+            "DbContext",
+            "DbSet<",
+            "IEntityTypeConfiguration",
+            "MigrationBuilder",
+            "modelBuilder.",
+            "OnModelCreating",
+        )
+    ):
+        return "efcore"
+
+    if any(
+        marker in content
+        for marker in (
+            "Microsoft.Extensions.",
+            "System.Text.Json",
+            "System.Threading.Tasks",
+        )
+    ):
+        return "dotnet"
+
+    return "generic"
 
 
 def is_json_array_of_dicts(content: str) -> bool:

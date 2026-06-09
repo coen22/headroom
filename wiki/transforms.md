@@ -354,7 +354,7 @@ AST-based compression for source code using tree-sitter.
 
 - **Syntax validity guaranteed** — Output always parses correctly
 - **Preserves critical structure** — Imports, signatures, types, error handlers
-- **Multi-language support** — Python, JavaScript, TypeScript, Go, Rust, Java, C, C++
+- **Multi-language support** — Python, JavaScript, TypeScript, Go, Rust, Java, C, C++, C# with EF Core, Unity, .NET, ASP.NET Core, Razor, MSBuild, solution, and Unity metadata profiles
 - **Lightweight** — ~50MB vs ~1GB for the ML compressor
 
 ### Installation
@@ -379,6 +379,7 @@ config = CodeCompressorConfig(
     max_body_lines=5,                   # Lines to keep per function body
     min_tokens_for_compression=100,     # Skip small content
     language_hint=None,                 # Auto-detect if None
+    profile_hint=None,                  # e.g. "unity", "dotnet", "aspnetcore", "efcore"
 )
 
 compressor = CodeAwareCompressor(config)
@@ -427,7 +428,8 @@ print(f"Syntax valid: {result.syntax_valid}")  # True
 | Tier | Languages | Support Level |
 |------|-----------|---------------|
 | 1 | Python, JavaScript, TypeScript | Full AST analysis |
-| 2 | Go, Rust, Java, C, C++ | Function body compression |
+| 2 | Go, Rust, Java, C, C++, C# | Function body compression |
+| Metadata | Razor, MSBuild, JSON config, solution files, Unity asmdef/asmref | Conservative structure preservation and secret redaction |
 
 ### Memory Management
 

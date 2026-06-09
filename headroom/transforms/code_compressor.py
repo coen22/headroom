@@ -16,7 +16,7 @@ Supported Languages (Tier 1):
 - Python, JavaScript, TypeScript
 
 Supported Languages (Tier 2):
-- Go, Rust, Java, C, C++
+- Go, Rust, Java, C, C++, C#
 
 Compression Strategy:
 1. Parse code into AST using tree-sitter
@@ -42,12 +42,14 @@ Reference:
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
+from xml.etree import ElementTree
 
 from ..config import TransformResult
 from ..tokenizer import Tokenizer
@@ -84,11 +86,11 @@ def _get_parser(language: str) -> Any:
     compression inside a ``ThreadPoolExecutor``, a single shared parser
     would be touched from arbitrary pool threads → instant crash.
 
-    We use the stock ``tree_sitter.Parser`` (which returns standard
-    ``tree_sitter.Node`` / ``tree_sitter.Tree`` with property access) and
-    set its language via ``tree_sitter_language_pack.get_language()``.
-    Storing one parser per (thread, language) satisfies the ``unsendable``
-    contract with negligible extra memory.
+    Prefer the stock ``tree_sitter.Parser`` plus
+    ``tree_sitter_language_pack.get_language()`` when available, and fall
+    back to the package's ``get_parser()`` API for compatibility with newer
+    language-pack releases. Storing one parser per (thread, language)
+    satisfies the ``unsendable`` contract with negligible extra memory.
 
     Args:
         language: Language name (e.g., 'python', 'javascript').
@@ -113,13 +115,22 @@ def _get_parser(language: str) -> Any:
 
     if language not in parsers:
         try:
-            from tree_sitter import Parser
-            from tree_sitter_language_pack import get_language
+            try:
+                from tree_sitter import Parser
+                from tree_sitter_language_pack import get_language
 
-            parser = Parser()
-            # `language` is a validated runtime str; get_language types its arg
-            # as a Literal of supported names, which a dynamic str can't satisfy.
-            parser.language = get_language(language)  # type: ignore[arg-type]
+                parser = Parser()
+                # `language` is a validated runtime str; get_language types its arg
+                # as a Literal of supported names, which a dynamic str can't satisfy.
+                parser.language = get_language(language)  # type: ignore[arg-type]
+            except Exception as get_language_error:
+                try:
+                    from tree_sitter_language_pack import get_parser
+
+                    parser = get_parser(language)  # type: ignore[arg-type]
+                except Exception as get_parser_error:
+                    raise get_language_error from get_parser_error
+
             parsers[language] = parser
             logger.debug(
                 "Loaded tree-sitter parser for %s (thread %s)",
@@ -129,7 +140,7 @@ def _get_parser(language: str) -> Any:
         except Exception as e:
             raise ValueError(
                 f"Language '{language}' is not supported by tree-sitter. "
-                f"Supported: python, javascript, typescript, go, rust, java, c, cpp. "
+                f"Supported: python, javascript, typescript, go, rust, java, c, cpp, csharp. "
                 f"Error: {e}"
             ) from e
 
@@ -183,7 +194,22 @@ class CodeLanguage(Enum):
     JAVA = "java"
     C = "c"
     CPP = "cpp"
+    CSHARP = "csharp"
+    RAZOR = "razor"
+    MSBUILD = "msbuild"
+    JSON = "json"
+    SOLUTION = "solution"
     UNKNOWN = "unknown"
+
+
+class CodeProfile(Enum):
+    """Framework/runtime profile layered on top of a source language."""
+
+    GENERIC = "generic"
+    DOTNET = "dotnet"
+    ASPNET_CORE = "aspnetcore"
+    EF_CORE = "efcore"
+    UNITY = "unity"
 
 
 class DocstringMode(Enum):
@@ -224,6 +250,1317 @@ class LangConfig:
 
     # Quick pre-filter hints for language detection (substrings to check)
     detection_hints: tuple[str, ...] = ()
+
+
+_LANGUAGE_ALIASES: dict[str, tuple[CodeLanguage, CodeProfile]] = {
+    "py": (CodeLanguage.PYTHON, CodeProfile.GENERIC),
+    "js": (CodeLanguage.JAVASCRIPT, CodeProfile.GENERIC),
+    "ts": (CodeLanguage.TYPESCRIPT, CodeProfile.GENERIC),
+    "c++": (CodeLanguage.CPP, CodeProfile.GENERIC),
+    "cc": (CodeLanguage.CPP, CodeProfile.GENERIC),
+    "cxx": (CodeLanguage.CPP, CodeProfile.GENERIC),
+    "cs": (CodeLanguage.CSHARP, CodeProfile.GENERIC),
+    "c#": (CodeLanguage.CSHARP, CodeProfile.GENERIC),
+    "csharp": (CodeLanguage.CSHARP, CodeProfile.GENERIC),
+    "c-sharp": (CodeLanguage.CSHARP, CodeProfile.GENERIC),
+    ".net": (CodeLanguage.CSHARP, CodeProfile.DOTNET),
+    "dotnet": (CodeLanguage.CSHARP, CodeProfile.DOTNET),
+    "aspnet": (CodeLanguage.CSHARP, CodeProfile.ASPNET_CORE),
+    "asp.net": (CodeLanguage.CSHARP, CodeProfile.ASPNET_CORE),
+    "aspnetcore": (CodeLanguage.CSHARP, CodeProfile.ASPNET_CORE),
+    "aspnet-core": (CodeLanguage.CSHARP, CodeProfile.ASPNET_CORE),
+    "asp.net core": (CodeLanguage.CSHARP, CodeProfile.ASPNET_CORE),
+    "asp.net-core": (CodeLanguage.CSHARP, CodeProfile.ASPNET_CORE),
+    "efcore": (CodeLanguage.CSHARP, CodeProfile.EF_CORE),
+    "ef-core": (CodeLanguage.CSHARP, CodeProfile.EF_CORE),
+    "entityframework": (CodeLanguage.CSHARP, CodeProfile.EF_CORE),
+    "entity-framework": (CodeLanguage.CSHARP, CodeProfile.EF_CORE),
+    "unity": (CodeLanguage.CSHARP, CodeProfile.UNITY),
+    "unity-csharp": (CodeLanguage.CSHARP, CodeProfile.UNITY),
+    "unity-c#": (CodeLanguage.CSHARP, CodeProfile.UNITY),
+    "razor": (CodeLanguage.RAZOR, CodeProfile.ASPNET_CORE),
+    "cshtml": (CodeLanguage.RAZOR, CodeProfile.ASPNET_CORE),
+    ".razor": (CodeLanguage.RAZOR, CodeProfile.ASPNET_CORE),
+    ".cshtml": (CodeLanguage.RAZOR, CodeProfile.ASPNET_CORE),
+    "csproj": (CodeLanguage.MSBUILD, CodeProfile.DOTNET),
+    ".csproj": (CodeLanguage.MSBUILD, CodeProfile.DOTNET),
+    "props": (CodeLanguage.MSBUILD, CodeProfile.DOTNET),
+    ".props": (CodeLanguage.MSBUILD, CodeProfile.DOTNET),
+    "targets": (CodeLanguage.MSBUILD, CodeProfile.DOTNET),
+    ".targets": (CodeLanguage.MSBUILD, CodeProfile.DOTNET),
+    "directory.build.props": (CodeLanguage.MSBUILD, CodeProfile.DOTNET),
+    "directory.build.targets": (CodeLanguage.MSBUILD, CodeProfile.DOTNET),
+    "msbuild": (CodeLanguage.MSBUILD, CodeProfile.DOTNET),
+    "sln": (CodeLanguage.SOLUTION, CodeProfile.DOTNET),
+    ".sln": (CodeLanguage.SOLUTION, CodeProfile.DOTNET),
+    "slnx": (CodeLanguage.SOLUTION, CodeProfile.DOTNET),
+    ".slnx": (CodeLanguage.SOLUTION, CodeProfile.DOTNET),
+    "asmdef": (CodeLanguage.JSON, CodeProfile.UNITY),
+    ".asmdef": (CodeLanguage.JSON, CodeProfile.UNITY),
+    "asmref": (CodeLanguage.JSON, CodeProfile.UNITY),
+    ".asmref": (CodeLanguage.JSON, CodeProfile.UNITY),
+    "unity-manifest": (CodeLanguage.JSON, CodeProfile.UNITY),
+    "unity-package": (CodeLanguage.JSON, CodeProfile.UNITY),
+    "unity-package-json": (CodeLanguage.JSON, CodeProfile.UNITY),
+    "appsettings": (CodeLanguage.JSON, CodeProfile.ASPNET_CORE),
+    "appsettings.json": (CodeLanguage.JSON, CodeProfile.ASPNET_CORE),
+    "appsettings.development.json": (CodeLanguage.JSON, CodeProfile.ASPNET_CORE),
+    "launchsettings": (CodeLanguage.JSON, CodeProfile.ASPNET_CORE),
+    "launchsettings.json": (CodeLanguage.JSON, CodeProfile.ASPNET_CORE),
+    "global.json": (CodeLanguage.JSON, CodeProfile.DOTNET),
+    "json": (CodeLanguage.JSON, CodeProfile.GENERIC),
+}
+
+
+def _normalize_language(value: str) -> tuple[CodeLanguage, CodeProfile]:
+    """Normalize user-facing language aliases to canonical language/profile values."""
+    normalized = value.strip().lower()
+    if normalized in _LANGUAGE_ALIASES:
+        return _LANGUAGE_ALIASES[normalized]
+    return CodeLanguage(normalized), CodeProfile.GENERIC
+
+
+def _normalize_profile(value: str | CodeProfile | None) -> CodeProfile | None:
+    """Normalize an optional user-facing profile hint."""
+    if value is None:
+        return None
+    if isinstance(value, CodeProfile):
+        return value
+    normalized = value.strip().lower().replace("_", "-")
+    aliases = {
+        "generic": CodeProfile.GENERIC,
+        "dotnet": CodeProfile.DOTNET,
+        ".net": CodeProfile.DOTNET,
+        "aspnet": CodeProfile.ASPNET_CORE,
+        "asp.net": CodeProfile.ASPNET_CORE,
+        "aspnetcore": CodeProfile.ASPNET_CORE,
+        "aspnet-core": CodeProfile.ASPNET_CORE,
+        "asp.net core": CodeProfile.ASPNET_CORE,
+        "asp.net-core": CodeProfile.ASPNET_CORE,
+        "efcore": CodeProfile.EF_CORE,
+        "ef-core": CodeProfile.EF_CORE,
+        "entityframework": CodeProfile.EF_CORE,
+        "entity-framework": CodeProfile.EF_CORE,
+        "unity": CodeProfile.UNITY,
+    }
+    if normalized in aliases:
+        return aliases[normalized]
+    return CodeProfile(normalized)
+
+
+def _infer_code_profile(code: str, language: CodeLanguage) -> CodeProfile:
+    """Infer a framework/runtime profile from source text."""
+    if language == CodeLanguage.JSON:
+        try:
+            parsed = json.loads(code)
+        except json.JSONDecodeError:
+            return CodeProfile.GENERIC
+        if isinstance(parsed, dict):
+            dependencies = parsed.get("dependencies")
+            dependency_names = set(dependencies) if isinstance(dependencies, dict) else set()
+            package_name = str(parsed.get("name", ""))
+            if (
+                package_name.startswith("com.unity.")
+                or any(str(name).startswith("com.unity.") for name in dependency_names)
+                or "scopedRegistries" in parsed
+                or "testables" in parsed
+            ):
+                return CodeProfile.UNITY
+            keys = {str(key).lower() for key in parsed}
+            if keys & {"logging", "connectionstrings", "allowedhosts", "kestrel", "profiles"}:
+                return CodeProfile.ASPNET_CORE
+            if "sdk" in keys:
+                return CodeProfile.DOTNET
+        return CodeProfile.GENERIC
+
+    if language != CodeLanguage.CSHARP:
+        return CodeProfile.GENERIC
+
+    unity_markers = (
+        "using UnityEngine;",
+        "using UnityEditor;",
+        "using Unity.Burst;",
+        "using Unity.Entities;",
+        "Unity.Burst",
+        "Unity.Entities",
+        "com.unity.entities",
+        "MonoBehaviour",
+        "ScriptableObject",
+        "IComponentData",
+        "IBufferElementData",
+        "ISharedComponentData",
+        "IEnableableComponent",
+        "ISystem",
+        "SystemBase",
+        "SystemAPI",
+        "EntityManager",
+        "Entities.ForEach",
+        "Baker<",
+        "IAspect",
+        "IJobEntity",
+        "Unity.Mathematics",
+        "Unity.Collections",
+        "Unity.Transforms",
+        "GameObject",
+        "Transform",
+        "Vector2",
+        "Vector3",
+        "Vector4",
+        "Quaternion",
+        "UNITY_",
+    )
+    if any(marker in code for marker in unity_markers):
+        return CodeProfile.UNITY
+
+    ef_markers = (
+        "DbContext",
+        "DbSet<",
+        "IEntityTypeConfiguration",
+        "EntityTypeBuilder",
+        "MigrationBuilder",
+        "modelBuilder.",
+        "OnModelCreating",
+        "UseSqlServer",
+        "UseNpgsql",
+        "UseSqlite",
+    )
+    if any(marker in code for marker in ef_markers):
+        return CodeProfile.EF_CORE
+
+    aspnet_markers = (
+        "Microsoft.AspNetCore",
+        "WebApplication.CreateBuilder",
+        "ControllerBase",
+        "IActionResult",
+        "TypedResults",
+        "StatusCodes.",
+        "MapGet(",
+        "MapPost(",
+        "MapOpenApi",
+        "AddOpenApi",
+        "AddValidation",
+        "[ApiController]",
+        "[HttpGet",
+        "[HttpPost",
+    )
+    if any(marker in code for marker in aspnet_markers):
+        return CodeProfile.ASPNET_CORE
+
+    dotnet_markers = (
+        "TargetFramework",
+        "Microsoft.Extensions.",
+        "System.Text.Json",
+        "System.Threading.Tasks",
+        "Console.WriteLine",
+        "Console.Read",
+        "Host.CreateApplicationBuilder",
+        "Host.CreateDefaultBuilder",
+        "IHostBuilder",
+        "IHostedService",
+        "BackgroundService",
+    )
+    if any(marker in code for marker in dotnet_markers):
+        return CodeProfile.DOTNET
+
+    return CodeProfile.GENERIC
+
+
+_UNITY_LIFECYCLE_METHODS = frozenset(
+    {
+        "Awake",
+        "OnEnable",
+        "Start",
+        "Update",
+        "FixedUpdate",
+        "LateUpdate",
+        "OnDisable",
+        "OnDestroy",
+        "OnValidate",
+        "Reset",
+        "OnCreate",
+        "OnUpdate",
+        "OnStartRunning",
+        "OnStopRunning",
+        "OnGUI",
+        "OnApplicationFocus",
+        "OnApplicationPause",
+        "OnApplicationQuit",
+        "OnTriggerEnter",
+        "OnTriggerStay",
+        "OnTriggerExit",
+        "OnTriggerEnter2D",
+        "OnTriggerStay2D",
+        "OnTriggerExit2D",
+        "OnCollisionEnter",
+        "OnCollisionStay",
+        "OnCollisionExit",
+        "OnCollisionEnter2D",
+        "OnCollisionStay2D",
+        "OnCollisionExit2D",
+        "OnDrawGizmos",
+        "OnDrawGizmosSelected",
+    }
+)
+
+_UNITY_ATTRIBUTES = frozenset(
+    {
+        "SerializeField",
+        "SerializeReference",
+        "HideInInspector",
+        "Header",
+        "Tooltip",
+        "Range",
+        "Min",
+        "ContextMenu",
+        "RequireComponent",
+        "DisallowMultipleComponent",
+        "AddComponentMenu",
+        "ExecuteAlways",
+        "ExecuteInEditMode",
+        "CreateAssetMenu",
+        "RuntimeInitializeOnLoadMethod",
+        "InitializeOnLoadMethod",
+        "MenuItem",
+        "CustomEditor",
+        "FormerlySerializedAs",
+        "BurstCompile",
+        "BurstDiscard",
+    }
+)
+
+_DOTNET_HOST_TYPE_SUFFIXES = frozenset(
+    {
+        "HostedService",
+        "BackgroundService",
+        "Worker",
+        "Service",
+    }
+)
+
+_DOTNET_HOST_CALL_MARKERS = frozenset(
+    {
+        "Console.WriteLine",
+        "Console.Error.WriteLine",
+        "Console.Read",
+        "Host.CreateApplicationBuilder",
+        "Host.CreateDefaultBuilder",
+        "CreateHostBuilder",
+        "ConfigureServices",
+        "ConfigureAppConfiguration",
+        "ConfigureLogging",
+        "builder.Services.",
+        "services.Add",
+        "AddHostedService",
+        "IHostedService",
+        "BackgroundService",
+        "RunAsync",
+        "RunConsoleAsync",
+    }
+)
+
+_UNITY_ENTITIES_INTERFACES = frozenset(
+    {
+        "IComponentData",
+        "IBufferElementData",
+        "ISharedComponentData",
+        "IEnableableComponent",
+        "ISystem",
+        "IAspect",
+        "IJobEntity",
+    }
+)
+
+_UNITY_ENTITIES_BASE_TYPES = frozenset(
+    {
+        "SystemBase",
+        "Baker<",
+        "ComponentSystemGroup",
+    }
+)
+
+_UNITY_ENTITIES_CALL_MARKERS = frozenset(
+    {
+        "SystemAPI.",
+        "SystemAPI.Query",
+        "EntityManager",
+        "state.EntityManager",
+        "Entities.ForEach",
+        "GetComponentLookup",
+        "GetBufferLookup",
+        "ComponentLookup<",
+        "DynamicBuffer<",
+        "EntityCommandBuffer",
+        "BlobAssetReference<",
+        "LocalTransform",
+        "IJobEntity",
+    }
+)
+
+_ASPNET_CORE_TYPE_SUFFIXES = frozenset(
+    {
+        "Controller",
+        "ControllerBase",
+        "PageModel",
+        "ComponentBase",
+        "Hub",
+        "Middleware",
+        "DbContext",
+        "BackgroundService",
+        "HostedService",
+        "Endpoint",
+        "Endpoints",
+    }
+)
+
+_ASPNET_CORE_ATTRIBUTES = frozenset(
+    {
+        "ApiController",
+        "Route",
+        "HttpGet",
+        "HttpPost",
+        "HttpPut",
+        "HttpPatch",
+        "HttpDelete",
+        "Authorize",
+        "AllowAnonymous",
+        "FromBody",
+        "FromQuery",
+        "FromRoute",
+        "FromHeader",
+        "FromForm",
+        "FromServices",
+        "Produces",
+        "ProducesResponseType",
+        "ProducesDefaultResponseType",
+        "Consumes",
+        "ValidateAntiForgeryToken",
+        "IgnoreAntiforgeryToken",
+        "Required",
+        "Range",
+        "StringLength",
+        "RegularExpression",
+        "JsonSerializable",
+        "PersistentState",
+    }
+)
+
+_ASPNET_CORE_CALL_MARKERS = frozenset(
+    {
+        "WebApplication.CreateBuilder",
+        "builder.Build",
+        "builder.Services.",
+        "builder.Configuration",
+        "app.Use",
+        "app.Map",
+        "app.Run",
+        "MapGet",
+        "MapPost",
+        "MapPut",
+        "MapPatch",
+        "MapDelete",
+        "MapGroup",
+        "MapControllers",
+        "MapRazorPages",
+        "MapBlazorHub",
+        "AddControllers",
+        "AddRazorPages",
+        "AddRazorComponents",
+        "AddEndpointsApiExplorer",
+        "AddOpenApi",
+        "MapOpenApi",
+        "AddSwaggerGen",
+        "AddAuthentication",
+        "AddAuthorization",
+        "AddDbContext",
+        "AddHostedService",
+        "AddValidation",
+        "ServerSentEvents",
+        "WithOpenApi",
+        "RequireAuthorization",
+    }
+)
+
+_EF_CORE_TYPE_SUFFIXES = frozenset(
+    {
+        "DbContext",
+        "Migration",
+        "EntityTypeConfiguration",
+    }
+)
+
+_EF_CORE_METHODS = frozenset(
+    {
+        "OnModelCreating",
+        "Configure",
+        "Up",
+        "Down",
+        "BuildTargetModel",
+    }
+)
+
+_EF_CORE_CALL_MARKERS = frozenset(
+    {
+        "DbSet<",
+        "DbContextOptions",
+        "IEntityTypeConfiguration",
+        "EntityTypeBuilder",
+        "modelBuilder.",
+        "HasKey",
+        "HasIndex",
+        "HasQueryFilter",
+        "HasData",
+        "OwnsOne",
+        "OwnsMany",
+        "Property(",
+        "ToTable",
+        "UseSqlServer",
+        "UseNpgsql",
+        "UseSqlite",
+        "UseInMemoryDatabase",
+        "AddDbContext",
+        "AddDbContextFactory",
+        "Database.Migrate",
+        "MigrationBuilder",
+        "migrationBuilder.",
+        "CreateTable",
+        "DropTable",
+        "AddColumn",
+        "DropColumn",
+        "AlterColumn",
+        "RenameColumn",
+        "CreateIndex",
+        "DropIndex",
+        "AddForeignKey",
+        "DropForeignKey",
+        "InsertData",
+        "UpdateData",
+        "DeleteData",
+        "EnsureSchema",
+    }
+)
+
+_ASPNET_ENDPOINT_RE = re.compile(
+    r"\b(?:app|group|endpoints|\w+)\."
+    r"(MapGet|MapPost|MapPut|MapPatch|MapDelete|MapMethods|MapGroup|"
+    r"MapControllers|MapRazorPages|MapBlazorHub|MapHub)\s*\("
+)
+
+_RAZOR_DIRECTIVE_RE = re.compile(
+    r"^\s*@(page|route|model|using|inject|implements|inherits|layout|rendermode)\b.*$"
+)
+_RAZOR_BLOCK_START_RE = re.compile(r"^\s*@(code|functions)\s*\{")
+
+_MSBUILD_KEEP_TAGS = frozenset(
+    {
+        "TargetFramework",
+        "TargetFrameworks",
+        "LangVersion",
+        "Nullable",
+        "ImplicitUsings",
+        "TreatWarningsAsErrors",
+        "WarningsAsErrors",
+        "GenerateDocumentationFile",
+        "GenerateOpenApiDocuments",
+        "OpenApiDocumentsDirectory",
+        "OpenApiGenerateDocumentsOptions",
+        "RootNamespace",
+        "AssemblyName",
+        "UserSecretsId",
+    }
+)
+_MSBUILD_KEEP_ITEMS = frozenset(
+    {
+        "PackageReference",
+        "ProjectReference",
+        "FrameworkReference",
+        "Using",
+        "Protobuf",
+        "Content",
+        "None",
+    }
+)
+_UNITY_ASMDEF_KEEP_KEYS = frozenset(
+    {
+        "name",
+        "references",
+        "includePlatforms",
+        "excludePlatforms",
+        "defineConstraints",
+        "versionDefines",
+        "precompiledReferences",
+        "allowUnsafeCode",
+        "autoReferenced",
+        "noEngineReferences",
+    }
+)
+_UNITY_PACKAGE_KEEP_KEYS = frozenset(
+    {
+        "name",
+        "displayName",
+        "version",
+        "unity",
+        "unityRelease",
+        "description",
+        "dependencies",
+        "scopedRegistries",
+        "testables",
+        "samples",
+        "keywords",
+        "author",
+        "hideInEditor",
+    }
+)
+_SECRET_KEY_RE = re.compile(r"(password|secret|token|apikey|api_key|connectionstrings?)", re.I)
+
+
+def _xml_escape(value: str) -> str:
+    """Escape text for small generated XML summaries."""
+    return (
+        value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    )
+
+
+def _local_xml_name(tag: str) -> str:
+    """Return XML tag name without namespace."""
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+def _compress_razor_artifact(content: str) -> tuple[str, bool]:
+    """Conservatively compress Razor markup while preserving directives and code blocks."""
+    lines = content.splitlines()
+    kept: list[tuple[int, str]] = []
+    index = 0
+
+    while index < len(lines):
+        line = lines[index]
+        if _RAZOR_DIRECTIVE_RE.match(line) or any(
+            marker in line
+            for marker in (
+                "[Parameter]",
+                "[CascadingParameter]",
+                "[PersistentState]",
+                "<EditForm",
+                "DataAnnotationsValidator",
+                "ValidationMessage",
+            )
+        ):
+            kept.append((index, line))
+            index += 1
+            continue
+
+        if _RAZOR_BLOCK_START_RE.match(line):
+            depth = line.count("{") - line.count("}")
+            kept.append((index, line))
+            index += 1
+            while index < len(lines):
+                block_line = lines[index]
+                kept.append((index, block_line))
+                depth += block_line.count("{") - block_line.count("}")
+                index += 1
+                if depth <= 0:
+                    break
+            continue
+
+        index += 1
+
+    if not kept:
+        return content, True
+
+    parts: list[str] = []
+    previous = -1
+    for line_index, line in kept:
+        omitted = line_index - previous - 1
+        if omitted > 0:
+            parts.append(f"@* [{omitted} lines omitted] *@")
+        parts.append(line)
+        previous = line_index
+    trailing = len(lines) - previous - 1
+    if trailing > 0:
+        parts.append(f"@* [{trailing} lines omitted] *@")
+
+    return "\n".join(parts), True
+
+
+def _compress_msbuild_artifact(content: str) -> tuple[str, bool]:
+    """Summarize MSBuild XML while preserving target frameworks and references."""
+    try:
+        root = ElementTree.fromstring(content)
+    except ElementTree.ParseError:
+        kept_lines = [
+            line
+            for line in content.splitlines()
+            if any(tag in line for tag in _MSBUILD_KEEP_TAGS | _MSBUILD_KEEP_ITEMS)
+        ]
+        if not kept_lines:
+            return content, False
+        omitted = len(content.splitlines()) - len(kept_lines)
+        if omitted > 0:
+            kept_lines.append(f"<!-- [{omitted} lines omitted] -->")
+        return "\n".join(kept_lines), False
+
+    root_name = _local_xml_name(root.tag)
+    root_attrs = " ".join(f'{key}="{_xml_escape(value)}"' for key, value in root.attrib.items())
+    root_open = f"<{root_name}{(' ' + root_attrs) if root_attrs else ''}>"
+    parts = [root_open]
+    omitted = 0
+
+    properties: list[str] = []
+    items: list[str] = []
+    for node in root.iter():
+        if node is root:
+            continue
+        name = _local_xml_name(node.tag)
+        if name in _MSBUILD_KEEP_TAGS:
+            text = (node.text or "").strip()
+            if text:
+                properties.append(f"    <{name}>{_xml_escape(text)}</{name}>")
+            else:
+                omitted += 1
+        elif name in _MSBUILD_KEEP_ITEMS:
+            attrs = " ".join(f'{key}="{_xml_escape(value)}"' for key, value in node.attrib.items())
+            if attrs:
+                items.append(f"    <{name} {attrs} />")
+            else:
+                omitted += 1
+        elif node is not root:
+            omitted += 1
+
+    if properties:
+        parts.append("  <PropertyGroup>")
+        parts.extend(properties)
+        parts.append("  </PropertyGroup>")
+    if items:
+        parts.append("  <ItemGroup>")
+        parts.extend(items)
+        parts.append("  </ItemGroup>")
+    if omitted > 0:
+        parts.append(f"  <!-- [{omitted} XML nodes omitted] -->")
+    parts.append(f"</{root_name}>")
+
+    return "\n".join(parts), True
+
+
+def _redact_json_metadata(value: Any, parent_key: str = "", force_redact: bool = False) -> Any:
+    """Recursively redact likely secrets while preserving config shape."""
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, child in value.items():
+            redact_child = (
+                force_redact
+                or bool(_SECRET_KEY_RE.search(key))
+                or bool(_SECRET_KEY_RE.search(parent_key))
+            )
+            if redact_child and not isinstance(child, (dict, list)):
+                result[key] = ""
+            else:
+                result[key] = _redact_json_metadata(child, key, redact_child)
+        return result
+    if isinstance(value, list):
+        return [_redact_json_metadata(item, parent_key, force_redact) for item in value]
+    if force_redact:
+        return ""
+    return value
+
+
+def _compress_json_artifact(content: str, profile: CodeProfile) -> tuple[str, bool]:
+    """Compress JSON metadata for Unity and ASP.NET/.NET config files."""
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        return content, False
+
+    if profile == CodeProfile.UNITY and isinstance(parsed, dict):
+        dependencies = parsed.get("dependencies")
+        dependency_names = set(dependencies) if isinstance(dependencies, dict) else set()
+        is_package_manifest = (
+            str(parsed.get("name", "")).startswith("com.")
+            or any(str(name).startswith("com.unity.") for name in dependency_names)
+            or "scopedRegistries" in parsed
+            or "testables" in parsed
+        )
+        keep_keys = _UNITY_PACKAGE_KEEP_KEYS if is_package_manifest else _UNITY_ASMDEF_KEEP_KEYS
+        compressed = {key: parsed[key] for key in keep_keys if key in parsed}
+        omitted = len(set(parsed) - set(compressed))
+        if omitted > 0:
+            compressed["_omitted"] = f"{omitted} keys"
+        return json.dumps(compressed, indent=2), True
+
+    if profile in (CodeProfile.ASPNET_CORE, CodeProfile.DOTNET, CodeProfile.EF_CORE):
+        return json.dumps(_redact_json_metadata(parsed), indent=2), True
+
+    return json.dumps(parsed, indent=2), True
+
+
+def _compress_solution_artifact(content: str) -> tuple[str, bool]:
+    """Summarize Visual Studio solution files while preserving project mappings."""
+    stripped = content.strip()
+    if stripped.startswith("<"):
+        try:
+            root = ElementTree.fromstring(stripped)
+        except ElementTree.ParseError:
+            pass
+        else:
+            root_name = _local_xml_name(root.tag)
+            parts = [f"<{root_name}>"]
+            omitted = 0
+            for node in root.iter():
+                if node is root:
+                    continue
+                name = _local_xml_name(node.tag)
+                if name in {"Project", "Folder", "SolutionFolder"}:
+                    attrs = " ".join(
+                        f'{key}="{_xml_escape(value)}"' for key, value in node.attrib.items()
+                    )
+                    parts.append(f"  <{name}{(' ' + attrs) if attrs else ''} />")
+                else:
+                    omitted += 1
+            if omitted > 0:
+                parts.append(f"  <!-- [{omitted} XML nodes omitted] -->")
+            parts.append(f"</{root_name}>")
+            return "\n".join(parts), True
+
+    lines = content.splitlines()
+    keep_patterns = (
+        "Microsoft Visual Studio Solution File",
+        "# Visual Studio Version",
+        "VisualStudioVersion",
+        "MinimumVisualStudioVersion",
+        "Project(",
+        "EndProject",
+        "GlobalSection(SolutionConfigurationPlatforms)",
+        "GlobalSection(ProjectConfigurationPlatforms)",
+        "EndGlobalSection",
+    )
+    kept = [line for line in lines if any(pattern in line for pattern in keep_patterns)]
+    if not kept:
+        return content, True
+    omitted = len(lines) - len(kept)
+    if omitted > 0:
+        kept.append(f"# [{omitted} lines omitted]")
+    return "\n".join(kept), True
+
+
+def _profile_symbol_boost(
+    *,
+    profile: CodeProfile,
+    short_name: str,
+    node_text: str,
+    file_text: str,
+) -> float:
+    """Score boost for framework entry points that are referenced by convention."""
+    boost = 0.0
+
+    if profile == CodeProfile.UNITY:
+        if short_name in _UNITY_LIFECYCLE_METHODS:
+            boost += 4.0
+        if "IEnumerator" in node_text and "yield return" in node_text:
+            boost += 2.0
+        if any(f"[{attr}" in node_text or f": {attr}" in node_text for attr in _UNITY_ATTRIBUTES):
+            boost += 2.0
+        if any(marker in node_text for marker in _UNITY_ENTITIES_INTERFACES):
+            boost += 3.0
+        if any(marker in node_text for marker in _UNITY_ENTITIES_BASE_TYPES):
+            boost += 3.0
+        if any(marker in node_text for marker in _UNITY_ENTITIES_CALL_MARKERS):
+            boost += 2.0
+        if "BurstCompile" in node_text or "Unity.Burst" in file_text:
+            boost += 2.0
+        if "MonoBehaviour" in file_text or "ScriptableObject" in file_text:
+            if short_name.startswith("On"):
+                boost += 1.0
+        if "Unity.Entities" in file_text or "com.unity.entities" in file_text:
+            if short_name.startswith("On") or short_name.endswith(("System", "Baker", "Aspect")):
+                boost += 1.0
+
+    elif profile == CodeProfile.ASPNET_CORE:
+        if any(marker in node_text for marker in _ASPNET_CORE_CALL_MARKERS):
+            boost += 3.0
+        if any(marker in node_text for marker in _EF_CORE_CALL_MARKERS):
+            boost += 2.0
+        if any(f"[{attr}" in node_text for attr in _ASPNET_CORE_ATTRIBUTES):
+            boost += 3.0
+        if short_name in {"Main", "Configure", "ConfigureServices", "CreateHostBuilder"}:
+            boost += 4.0
+        if short_name.startswith(("OnGet", "OnPost", "OnPut", "OnDelete", "OnPatch")):
+            boost += 3.0
+        if short_name.endswith(tuple(_ASPNET_CORE_TYPE_SUFFIXES)):
+            boost += 1.5
+
+    elif profile == CodeProfile.EF_CORE:
+        if short_name in _EF_CORE_METHODS:
+            boost += 4.0
+        if any(marker in node_text for marker in _EF_CORE_CALL_MARKERS):
+            boost += 3.0
+        if short_name.endswith(tuple(_EF_CORE_TYPE_SUFFIXES)):
+            boost += 2.0
+
+    elif profile == CodeProfile.DOTNET:
+        if short_name in {
+            "Main",
+            "CreateHostBuilder",
+            "ConfigureServices",
+            "ConfigureLogging",
+            "ConfigureAppConfiguration",
+        }:
+            boost += 2.0
+        if any(marker in node_text for marker in _DOTNET_HOST_CALL_MARKERS):
+            boost += 2.0
+        if short_name.endswith(tuple(_DOTNET_HOST_TYPE_SUFFIXES)):
+            boost += 1.0
+
+    return boost
+
+
+def _should_preserve_statement_for_profile(statement_text: str, profile: CodeProfile) -> bool:
+    """Return True for statements that carry framework runtime wiring."""
+    if "nameof(" in statement_text:
+        return True
+
+    if profile == CodeProfile.UNITY:
+        return bool(
+            "yield return" in statement_text
+            or "UNITY_" in statement_text
+            or any(f"[{attr}" in statement_text for attr in _UNITY_ATTRIBUTES)
+            or any(marker in statement_text for marker in _UNITY_ENTITIES_CALL_MARKERS)
+            or "BurstCompile" in statement_text
+        )
+
+    if profile == CodeProfile.ASPNET_CORE:
+        return bool(
+            _ASPNET_ENDPOINT_RE.search(statement_text)
+            or any(marker in statement_text for marker in _ASPNET_CORE_CALL_MARKERS)
+            or any(marker in statement_text for marker in _EF_CORE_CALL_MARKERS)
+            or any(f"[{attr}" in statement_text for attr in _ASPNET_CORE_ATTRIBUTES)
+        )
+
+    if profile == CodeProfile.EF_CORE:
+        return bool(any(marker in statement_text for marker in _EF_CORE_CALL_MARKERS))
+
+    if profile == CodeProfile.DOTNET:
+        return bool(any(marker in statement_text for marker in _DOTNET_HOST_CALL_MARKERS))
+
+    return False
+
+
+def _extract_named_arguments(statement_text: str, names: tuple[str, ...]) -> list[str]:
+    """Extract common C# named string arguments from a statement."""
+    values: list[str] = []
+    for name in names:
+        for match in re.finditer(rf"\b{name}\s*:\s*\"([^\"]+)\"", statement_text):
+            values.append(f"{name}={match.group(1)}")
+    return values
+
+
+def _summarize_profile_statement(
+    statement_text: str,
+    profile: CodeProfile,
+    indent: str,
+    comment_prefix: str,
+) -> str | None:
+    """Summarize bulky framework-critical C# statements without losing their role."""
+    stripped = " ".join(line.strip() for line in statement_text.splitlines() if line.strip())
+    if not stripped:
+        return None
+
+    line_count = max(1, len(statement_text.splitlines()))
+
+    if profile == CodeProfile.EF_CORE:
+        operations = [
+            marker
+            for marker in _EF_CORE_CALL_MARKERS
+            if marker in statement_text and marker != "migrationBuilder."
+        ]
+        if not operations and "migrationBuilder." in statement_text:
+            operations = ["migrationBuilder."]
+        if not operations:
+            return None
+        operation = sorted(operations, key=len, reverse=True)[0].rstrip("(").rstrip(".")
+        details = _extract_named_arguments(
+            statement_text,
+            ("name", "table", "column", "columns", "keyColumn", "schema"),
+        )
+        suffix = f": {', '.join(details[:6])}" if details else ""
+        return f"{indent}{comment_prefix} [efcore: {operation}{suffix}]"
+
+    if profile == CodeProfile.UNITY:
+        if not any(marker in statement_text for marker in _UNITY_ENTITIES_CALL_MARKERS):
+            return None
+        if "SystemAPI.Query" in statement_text:
+            query_match = re.search(r"SystemAPI\.Query<([^>]+)>", statement_text)
+            component_count = 0
+            if query_match:
+                query = query_match.group(1).replace("\n", " ")
+                component_count = max(1, query.count(",") + 1)
+            detail = f" {component_count} components" if component_count else ""
+            return (
+                f"{indent}{comment_prefix} [unity-entities: SystemAPI.Query{detail} body omitted]"
+            )
+        if "Entities.ForEach" in statement_text:
+            return f"{indent}{comment_prefix} [unity-entities: Entities.ForEach body omitted]"
+        marker = next(marker for marker in _UNITY_ENTITIES_CALL_MARKERS if marker in statement_text)
+        return f"{indent}{comment_prefix} [unity-entities: {marker} statement omitted]"
+
+    if profile == CodeProfile.ASPNET_CORE and _ASPNET_ENDPOINT_RE.search(statement_text):
+        if line_count <= 1:
+            return None
+        endpoint = _ASPNET_ENDPOINT_RE.search(statement_text)
+        route = re.search(r"\(\s*\"([^\"]+)\"", statement_text)
+        name = re.search(r"\.WithName\(\s*\"([^\"]+)\"\s*\)", statement_text)
+        parts = [endpoint.group(1) if endpoint else "MapEndpoint"]
+        if route:
+            parts.append(f'route="{route.group(1)}"')
+        if name:
+            parts.append(f'name="{name.group(1)}"')
+        if "WithOpenApi" in statement_text:
+            parts.append("WithOpenApi")
+        if "RequireAuthorization" in statement_text:
+            parts.append("RequireAuthorization")
+        return f"{indent}{comment_prefix} [aspnet: {' '.join(parts)} handler omitted]"
+
+    if profile == CodeProfile.DOTNET:
+        if line_count <= 1:
+            return None
+        marker = next(
+            (marker for marker in _DOTNET_HOST_CALL_MARKERS if marker in statement_text), None
+        )
+        if marker:
+            generic = re.search(r"<([^>]+)>", statement_text)
+            target = f"<{generic.group(1)}>" if generic else ""
+            return f"{indent}{comment_prefix} [dotnet-host: {marker}{target} statement omitted]"
+
+    return None
+
+
+def _summarize_top_level_statement(
+    statement_text: str,
+    profile: CodeProfile,
+    comment_prefix: str,
+) -> str | None:
+    """Summarize a top-level framework wiring statement when that saves tokens."""
+    if not _should_preserve_statement_for_profile(statement_text, profile):
+        return None
+    summary = _summarize_profile_statement(statement_text, profile, "", comment_prefix)
+    if summary is None:
+        return None
+    return summary if len(summary) < len(statement_text.strip()) else None
+
+
+def _strip_csharp_attributes(text: str) -> str:
+    """Remove C# attribute lists from a declaration string."""
+    return re.sub(r"\[[^\]]+\]\s*", "", text).strip()
+
+
+def _extract_csharp_member_summary(member_text: str) -> str | None:
+    """Extract a compact `Type name` summary from a C# field/property declaration."""
+    text = _strip_csharp_attributes(member_text)
+    text = re.sub(r"//.*", "", text)
+    text = " ".join(text.replace("\n", " ").split())
+    if not text:
+        return None
+
+    for separator in ("=>", "=", ";", "{"):
+        text = text.split(separator, 1)[0].strip()
+
+    text = re.sub(
+        r"\b(public|private|protected|internal|static|readonly|const|volatile|new|sealed|"
+        r"override|virtual|partial|unsafe|required|ref)\b\s*",
+        "",
+        text,
+    ).strip()
+
+    parts = text.split()
+    if len(parts) < 2:
+        return None
+
+    name = parts[-1]
+    type_name = " ".join(parts[:-1])
+    return f"{type_name} {name}"
+
+
+def _summarize_member_group(
+    group_kind: str,
+    members: list[str],
+    indent: str,
+    comment_prefix: str,
+) -> str:
+    """Build a compact class-member summary comment."""
+    label_by_kind = {
+        "csharp-private-members": "private members",
+        "unity-serialized": "unity serialized fields",
+        "unity-dots-schema": "unity-dots schema",
+        "efcore-dbsets": "efcore dbsets",
+    }
+    label = label_by_kind.get(group_kind, group_kind)
+    preview_items = _compact_csharp_member_summaries(members[:8])
+    preview = "; ".join(preview_items)
+    if len(members) > 8:
+        preview += f"; +{len(members) - 8} more"
+    return f"{indent}{comment_prefix} [{label}: {preview}]"
+
+
+def _compact_csharp_member_summaries(members: list[str]) -> list[str]:
+    """Compact repeated `Type name` member summaries without losing names."""
+    grouped: list[tuple[str, list[str]]] = []
+    index_by_type: dict[str, int] = {}
+
+    for member in members:
+        if " " not in member:
+            grouped.append((member, []))
+            continue
+
+        type_name, name = member.rsplit(" ", 1)
+        if type_name in index_by_type:
+            grouped[index_by_type[type_name]][1].append(name)
+        else:
+            index_by_type[type_name] = len(grouped)
+            grouped.append((type_name, [name]))
+
+    compacted: list[str] = []
+    for type_name, names in grouped:
+        if not names:
+            compacted.append(type_name)
+        elif len(names) == 1:
+            compacted.append(f"{type_name} {names[0]}")
+        else:
+            compacted.append(f"{type_name} {','.join(names)}")
+    return compacted
+
+
+def _extract_csharp_method_name(method_text: str) -> str | None:
+    """Extract a C# method name from a method declaration string."""
+    signature = method_text.split("{", 1)[0]
+    signature = _strip_csharp_attributes(signature)
+    matches = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^>]+>)?\s*\(", signature)
+    if not matches:
+        return None
+    return matches[-1]
+
+
+def _extract_csharp_type_name(type_text: str) -> str | None:
+    """Extract a C# class/struct/interface/record name from a type declaration."""
+    match = re.search(r"\b(?:class|struct|interface|record)\s+([A-Za-z_][A-Za-z0-9_]*)", type_text)
+    return match.group(1) if match else None
+
+
+def _summarize_schema_only_type(
+    type_text: str,
+    body_parts: list[str],
+    profile: CodeProfile,
+    comment_prefix: str,
+) -> str | None:
+    """Collapse schema-only C# types to a single summary comment."""
+    if len(body_parts) != 1:
+        return None
+    body_summary = body_parts[0].strip()
+    type_name = _extract_csharp_type_name(type_text)
+    if not type_name:
+        return None
+
+    if profile == CodeProfile.UNITY and "unity-dots schema:" in body_summary:
+        schema = body_summary.split("unity-dots schema:", 1)[1].rstrip(" ]")
+        return f"{comment_prefix} [unity-dots schema {type_name}: {schema}]"
+
+    if profile == CodeProfile.EF_CORE and "efcore dbsets:" in body_summary:
+        dbsets = body_summary.split("efcore dbsets:", 1)[1].rstrip(" ]")
+        return f"{comment_prefix} [efcore dbsets {type_name}: {dbsets}]"
+
+    return None
+
+
+def _summarize_unity_method(
+    method_text: str,
+    type_text: str,
+    indent: str,
+    comment_prefix: str,
+) -> tuple[str, str] | None:
+    """Return a compact Unity method summary kind and text."""
+    method_name = _extract_csharp_method_name(method_text)
+    if not method_name:
+        return None
+
+    if any(marker in method_text for marker in _UNITY_ENTITIES_CALL_MARKERS):
+        summary = _summarize_profile_statement(
+            method_text,
+            CodeProfile.UNITY,
+            indent,
+            comment_prefix,
+        )
+        if summary:
+            return ("entity", summary)
+
+    if method_name not in _UNITY_LIFECYCLE_METHODS:
+        return None
+    if not any(marker in type_text for marker in ("MonoBehaviour", "ScriptableObject", "ISystem")):
+        return None
+    return ("lifecycle", method_name)
+
+
+def _summarize_unity_preprocessor_block(
+    block_text: str,
+    indent: str,
+    comment_prefix: str,
+) -> str | None:
+    """Summarize Unity lifecycle methods inside preprocessor guards."""
+    method_names = [
+        name for name in _UNITY_LIFECYCLE_METHODS if re.search(rf"\b{name}\s*\(", block_text)
+    ]
+    if not method_names:
+        return None
+
+    lines = block_text.split("\n")
+    directives = [line for line in lines if line.strip().startswith("#")]
+    if not directives:
+        return None
+
+    names = ",".join(sorted(method_names))
+    return "\n".join(
+        [directives[0], f"{indent}{comment_prefix} [unity lifecycle: {names}]", *directives[1:]]
+    )
+
+
+def _compact_csharp_profile_imports(
+    compressed: str,
+    language: CodeLanguage,
+    profile: CodeProfile,
+) -> str:
+    """Drop C# framework imports that no longer back preserved code."""
+    if language != CodeLanguage.CSHARP or profile == CodeProfile.GENERIC:
+        return compressed
+
+    lines = compressed.split("\n")
+    using_re = re.compile(r"^\s*using\s+([A-Za-z_][A-Za-z0-9_.]*)\s*;")
+    body_text = "\n".join(line for line in lines if not using_re.match(line))
+    compacted: list[str] = []
+
+    for line in lines:
+        match = using_re.match(line)
+        if not match:
+            compacted.append(line)
+            continue
+        namespace = match.group(1)
+        if _should_keep_csharp_profile_import(namespace, body_text, profile):
+            compacted.append(line)
+
+    return "\n".join(compacted).strip("\n")
+
+
+def _should_keep_csharp_profile_import(
+    namespace: str,
+    body_text: str,
+    profile: CodeProfile,
+) -> bool:
+    """Return whether a C# import still carries framework meaning after compression."""
+    non_comment_body = "\n".join(
+        line for line in body_text.split("\n") if not line.strip().startswith("//")
+    )
+    if profile == CodeProfile.UNITY:
+        if namespace == "UnityEngine":
+            return any(
+                marker in body_text
+                for marker in (
+                    "MonoBehaviour",
+                    "ScriptableObject",
+                    "RequireComponent",
+                    "CreateAssetMenu",
+                    "Rigidbody",
+                    "Transform",
+                    "Vector3",
+                    "Mathf",
+                )
+            )
+        if namespace == "Unity.Entities":
+            return any(
+                marker in body_text
+                for marker in ("IComponentData", "ISystem", "SystemAPI", "unity-entities")
+            )
+        if namespace == "Unity.Burst":
+            return "BurstCompile" in body_text or "BurstDiscard" in body_text
+        if namespace == "Unity.Mathematics":
+            return any(
+                marker in non_comment_body
+                for marker in ("float2", "float3", "float4", "quaternion")
+            )
+        if namespace == "Unity.Transforms":
+            return any(marker in non_comment_body for marker in ("LocalTransform", "LocalToWorld"))
+
+    if profile == CodeProfile.EF_CORE:
+        if namespace == "Microsoft.EntityFrameworkCore":
+            return any(marker in body_text for marker in ("DbContext", "DbSet", "efcore"))
+        if namespace == "Microsoft.EntityFrameworkCore.Migrations":
+            return any(
+                marker in body_text for marker in ("Migration", "migrationBuilder", "efcore")
+            )
+
+    if profile == CodeProfile.ASPNET_CORE:
+        if namespace == "System.ComponentModel.DataAnnotations":
+            return any(marker in body_text for marker in ("[Required", "[Range", "Validation"))
+        if namespace == "Microsoft.AspNetCore.Mvc":
+            return any(
+                marker in body_text
+                for marker in ("[ApiController]", "ControllerBase", "IActionResult", "aspnet")
+            )
+        if namespace == "Microsoft.AspNetCore.Builder":
+            return any(marker in body_text for marker in ("WebApplication", "Map", "aspnet"))
+        if namespace in {"Microsoft.AspNetCore.Http", "Microsoft.AspNetCore.Http.HttpResults"}:
+            return any(marker in body_text for marker in ("TypedResults", "Results", "IResult"))
+
+    if profile == CodeProfile.DOTNET:
+        if namespace == "Microsoft.Extensions.Hosting":
+            return any(
+                marker in body_text
+                for marker in ("BackgroundService", "IHostedService", "Host.", "dotnet-host")
+            )
+
+    return namespace.split(".")[-1] in body_text
+
+
+def _member_group_kind(
+    child_type: str, child_text: str, type_text: str, profile: CodeProfile
+) -> str | None:
+    """Return the summary group kind for a C# class/struct member."""
+    if child_type not in {
+        "field_declaration",
+        "property_declaration",
+        "event_declaration",
+        "event_field_declaration",
+        "indexer_declaration",
+    }:
+        return None
+
+    stripped_text = _strip_csharp_attributes(child_text)
+
+    if profile == CodeProfile.UNITY:
+        is_dots_data = any(interface in type_text for interface in _UNITY_ENTITIES_INTERFACES)
+        if is_dots_data and child_type == "field_declaration":
+            return "unity-dots-schema"
+
+        is_serialized = (
+            "[SerializeField" in child_text
+            or "[SerializeReference" in child_text
+            or "[field: SerializeField" in child_text
+        )
+        is_public_field = child_type == "field_declaration" and re.search(
+            r"\bpublic\b", stripped_text
+        )
+        is_private_state = child_type == "field_declaration" and re.search(
+            r"\bprivate\b", stripped_text
+        )
+        if ("MonoBehaviour" in type_text or "ScriptableObject" in type_text) and (
+            is_serialized or is_public_field or is_private_state
+        ):
+            return "unity-serialized"
+
+    if profile == CodeProfile.EF_CORE and "DbContext" in type_text and "DbSet<" in child_text:
+        return "efcore-dbsets"
+
+    if (
+        child_type in {"field_declaration", "event_field_declaration"}
+        and re.search(r"\bprivate\b", stripped_text)
+        and not re.search(r"\b(public|protected|internal)\b", stripped_text)
+    ):
+        return "csharp-private-members"
+
+    return None
 
 
 _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
@@ -317,6 +1654,61 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         uses_colon_after_signature=False,
         detection_hints=("#include", "namespace ", "class ", "::"),
     ),
+    CodeLanguage.CSHARP: LangConfig(
+        import_nodes=frozenset({"using_directive", "extern_alias_directive"}),
+        function_nodes=frozenset(
+            {
+                "method_declaration",
+                "constructor_declaration",
+                "destructor_declaration",
+                "operator_declaration",
+                "conversion_operator_declaration",
+                "local_function_statement",
+            }
+        ),
+        class_nodes=frozenset(
+            {
+                "class_declaration",
+                "interface_declaration",
+                "struct_declaration",
+                "record_declaration",
+                "namespace_declaration",
+                "extension_declaration",
+            }
+        ),
+        type_nodes=frozenset(
+            {
+                "enum_declaration",
+                "delegate_declaration",
+                "file_scoped_namespace_declaration",
+            }
+        ),
+        body_node_types=frozenset({"block", "declaration_list", "extension_body"}),
+        decorator_node=None,
+        comment_prefix="//",
+        uses_colon_after_signature=False,
+        detection_hints=(
+            "using ",
+            "namespace ",
+            "public ",
+            "private ",
+            "protected ",
+            "internal ",
+            "class ",
+            "struct ",
+            "record ",
+            "interface ",
+            "enum ",
+            "delegate ",
+            "async Task",
+            "IEnumerable<",
+            "IActionResult",
+            "WebApplication",
+            "MapGet(",
+            "MonoBehaviour",
+            "UnityEngine",
+        ),
+    ),
 }
 
 
@@ -352,6 +1744,7 @@ class CodeCompressorConfig:
         compress_comments: Remove non-docstring comments.
         min_tokens_for_compression: Minimum tokens to trigger compression.
         language_hint: Explicit language (None = auto-detect).
+        profile_hint: Explicit framework/runtime profile (None = infer from language/content).
         fallback_to_kompress: Use Kompress for unknown languages.
         enable_ccr: Store originals for retrieval.
         ccr_ttl: TTL for CCR entries in seconds.
@@ -374,6 +1767,7 @@ class CodeCompressorConfig:
 
     # Language handling
     language_hint: str | None = None
+    profile_hint: str | CodeProfile | None = None
     fallback_to_kompress: bool = True
 
     # Semantic analysis (symbol importance scoring)
@@ -395,6 +1789,7 @@ class CodeCompressionResult:
         compressed_tokens: Token count after compression.
         compression_ratio: Actual compression ratio achieved.
         language: Detected or specified language.
+        profile: Detected or specified framework/runtime profile.
         language_confidence: Confidence in language detection.
         preserved_imports: Number of import statements preserved.
         preserved_signatures: Number of function signatures preserved.
@@ -411,6 +1806,7 @@ class CodeCompressionResult:
 
     # Code-specific metadata
     language: CodeLanguage = CodeLanguage.UNKNOWN
+    profile: CodeProfile = CodeProfile.GENERIC
     language_confidence: float = 0.0
 
     # Structure analysis
@@ -449,7 +1845,7 @@ class CodeCompressionResult:
             if high or low:
                 analysis_note = f" Semantic: {high} high-importance, {low} low-importance."
         return (
-            f"Compressed {self.language.value} code: "
+            f"Compressed {self.language.value}/{self.profile.value} code: "
             f"{self.original_tokens:,}→{self.compressed_tokens:,} tokens "
             f"({self.savings_percentage:.0f}% saved). "
             f"Kept {self.preserved_imports} imports, "
@@ -506,6 +1902,32 @@ _LANGUAGE_PREFILTER: dict[CodeLanguage, list[re.Pattern[str]]] = {
         re.compile(r"\bnamespace\s+\w+", re.MULTILINE),
         re.compile(r"::\w+", re.MULTILINE),
     ],
+    CodeLanguage.CSHARP: [
+        re.compile(
+            r"^\s*using\s+(static\s+)?(\w+\s*=\s*)?[\w.<>]+;",
+            re.MULTILINE,
+        ),
+        re.compile(r"^\s*namespace\s+[\w.]+(\s*;|\s*\{)", re.MULTILINE),
+        re.compile(
+            r"^\s*(\[[^\]]+\]\s*)*"
+            r"(public|private|protected|internal|sealed|abstract|partial|static|unsafe|"
+            r"readonly|ref)\s+"
+            r"(class|struct|record|interface|enum|delegate)\b",
+            re.MULTILINE,
+        ),
+        re.compile(
+            r"\b(Task|ValueTask|IEnumerable|IActionResult|ActionResult)(<[^>]+>)?\b",
+            re.MULTILINE,
+        ),
+        re.compile(
+            r"\b(MonoBehaviour|UnityEngine|SerializeField|WebApplication|Map(Get|Post|Put|"
+            r"Delete|Patch)|ControllerBase|ApiController|Http(Get|Post|Put|Delete|Patch)|"
+            r"Unity\.Burst|BurstCompile|Unity\.Entities|IComponentData|ISystem|SystemAPI|"
+            r"Console\.WriteLine|Console\.Read|Host\.CreateApplicationBuilder|"
+            r"Host\.CreateDefaultBuilder|IHostedService|BackgroundService)\b",
+            re.MULTILINE,
+        ),
+    ],
 }
 
 
@@ -559,6 +1981,37 @@ def detect_language(code: str) -> tuple[CodeLanguage, float]:
     if CodeLanguage.CPP in candidates and CodeLanguage.C in candidates:
         if candidates[CodeLanguage.CPP] >= 2:
             candidates[CodeLanguage.C] = 0
+
+    # Disambiguation: C# overlaps with Java and C++ in short class snippets.
+    if CodeLanguage.CSHARP in candidates:
+        csharp_markers = (
+            "using ",
+            "namespace ",
+            "record ",
+            "init;",
+            "required ",
+            "MonoBehaviour",
+            "UnityEngine",
+            "[SerializeField]",
+            "async Task",
+            "IActionResult",
+            "ControllerBase",
+            "WebApplication",
+            "MapGet(",
+            "Results.",
+        )
+
+        if any(marker in sample for marker in csharp_markers):
+            candidates[CodeLanguage.CSHARP] += 2
+
+        if "#include" in sample:
+            candidates[CodeLanguage.CSHARP] = 0
+
+        if re.search(r"^\s*package\s+", sample, re.MULTILINE) and "using " not in sample:
+            candidates[CodeLanguage.CSHARP] = 0
+
+        if CodeLanguage.JAVA in candidates and candidates[CodeLanguage.CSHARP] >= 2:
+            candidates[CodeLanguage.JAVA] = 0
 
     # Phase 2: If tree-sitter available, parse with candidates and pick fewest errors
     if _check_tree_sitter_available():
@@ -701,6 +2154,46 @@ class CodeAwareCompressor(Transform):
         # (code has lots of punctuation that tokenizes separately)
         return max(1, len(text) // 4)
 
+    def _compress_artifact(
+        self,
+        code: str,
+        language: CodeLanguage,
+        profile: CodeProfile,
+        confidence: float,
+        original_tokens: int,
+        tokenizer: Tokenizer | None = None,
+    ) -> CodeCompressionResult:
+        """Compress non-C# metadata artifacts without tree-sitter."""
+        if language == CodeLanguage.RAZOR:
+            compressed, syntax_valid = _compress_razor_artifact(code)
+        elif language == CodeLanguage.MSBUILD:
+            compressed, syntax_valid = _compress_msbuild_artifact(code)
+        elif language == CodeLanguage.JSON:
+            compressed, syntax_valid = _compress_json_artifact(code, profile)
+        elif language == CodeLanguage.SOLUTION:
+            compressed, syntax_valid = _compress_solution_artifact(code)
+        else:
+            compressed, syntax_valid = code, True
+
+        if not compressed.strip():
+            compressed = code
+            syntax_valid = True
+
+        compressed_tokens = self._estimate_tokens(compressed, tokenizer)
+        ratio = compressed_tokens / max(original_tokens, 1)
+
+        return CodeCompressionResult(
+            compressed=compressed,
+            original=code,
+            original_tokens=original_tokens,
+            compressed_tokens=compressed_tokens,
+            compression_ratio=ratio,
+            language=language,
+            profile=profile,
+            language_confidence=confidence,
+            syntax_valid=syntax_valid,
+        )
+
     # =========================================================================
     # Symbol importance analysis
     # =========================================================================
@@ -710,6 +2203,7 @@ class CodeAwareCompressor(Transform):
         root: Any,
         code: str,
         language: CodeLanguage,
+        profile: CodeProfile,
         context: str = "",
     ) -> _SymbolAnalysis:
         """Analyze symbol importance using distribution-based scoring.
@@ -823,7 +2317,10 @@ class CodeAwareCompressor(Transform):
             short = bare_names[qname]
             refs = ref_counts.get(qname, 0)
             fan_out = len(function_calls.get(qname, set()))
-            is_public = _is_public_symbol(short, language)
+            if language == CodeLanguage.CSHARP:
+                is_public = _is_csharp_public_symbol(definitions[qname], code)
+            else:
+                is_public = _is_public_symbol(short, language)
 
             raw = float(refs)
             raw += 1.0 if is_public else 0.0
@@ -836,6 +2333,14 @@ class CodeAwareCompressor(Transform):
             elif language == CodeLanguage.GO:
                 if short and short[0].isupper():
                     raw += 1.0
+            elif language == CodeLanguage.CSHARP:
+                node_text = _get_node_text(definitions[qname], code)
+                raw += _profile_symbol_boost(
+                    profile=profile,
+                    short_name=short,
+                    node_text=node_text,
+                    file_text=code,
+                )
 
             # Context boost
             if context_words:
@@ -923,6 +2428,7 @@ class CodeAwareCompressor(Transform):
         self,
         code: str,
         language: str | None = None,
+        profile: str | CodeProfile | None = None,
         context: str = "",
         tokenizer: Tokenizer | None = None,
     ) -> CodeCompressionResult:
@@ -931,6 +2437,7 @@ class CodeAwareCompressor(Transform):
         Args:
             code: Source code to compress.
             language: Language name (e.g., 'python'). Auto-detected if None.
+            profile: Framework/runtime profile (e.g., 'unity', 'aspnetcore').
             context: Optional context for relevance-aware compression.
             tokenizer: Optional tokenizer for accurate token counting.
 
@@ -949,7 +2456,41 @@ class CodeAwareCompressor(Transform):
 
         original_tokens = self._estimate_tokens(code, tokenizer)
 
-        # Skip small content
+        # Detect or use specified language
+        explicit_profile = _normalize_profile(profile)
+        if language:
+            detected_lang, alias_profile = _normalize_language(language)
+            confidence = 1.0
+        elif self.config.language_hint:
+            detected_lang, alias_profile = _normalize_language(self.config.language_hint)
+            confidence = 1.0
+        else:
+            detected_lang, confidence = detect_language(code)
+            alias_profile = CodeProfile.GENERIC
+
+        detected_profile = explicit_profile or _normalize_profile(self.config.profile_hint)
+        if detected_profile is None:
+            detected_profile = alias_profile
+        if detected_profile == CodeProfile.GENERIC:
+            detected_profile = _infer_code_profile(code, detected_lang)
+
+        # Metadata artifacts are intentionally handled outside tree-sitter.
+        if detected_lang in {
+            CodeLanguage.RAZOR,
+            CodeLanguage.MSBUILD,
+            CodeLanguage.JSON,
+            CodeLanguage.SOLUTION,
+        }:
+            return self._compress_artifact(
+                code,
+                detected_lang,
+                detected_profile,
+                confidence,
+                original_tokens,
+                tokenizer,
+            )
+
+        # Skip small content, but preserve explicit language/profile metadata.
         if original_tokens < self.config.min_tokens_for_compression:
             return CodeCompressionResult(
                 compressed=code,
@@ -957,18 +2498,11 @@ class CodeAwareCompressor(Transform):
                 original_tokens=original_tokens,
                 compressed_tokens=original_tokens,
                 compression_ratio=1.0,
+                language=detected_lang,
+                profile=detected_profile,
+                language_confidence=confidence,
                 syntax_valid=True,
             )
-
-        # Detect or use specified language
-        if language:
-            detected_lang = CodeLanguage(language.lower())
-            confidence = 1.0
-        elif self.config.language_hint:
-            detected_lang = CodeLanguage(self.config.language_hint.lower())
-            confidence = 1.0
-        else:
-            detected_lang, confidence = detect_language(code)
 
         # If language unknown and fallback enabled, try Kompress
         if detected_lang == CodeLanguage.UNKNOWN:
@@ -982,6 +2516,7 @@ class CodeAwareCompressor(Transform):
                     compressed_tokens=original_tokens,
                     compression_ratio=1.0,
                     language=CodeLanguage.UNKNOWN,
+                    profile=CodeProfile.GENERIC,
                     language_confidence=0.0,
                     syntax_valid=True,
                 )
@@ -998,6 +2533,7 @@ class CodeAwareCompressor(Transform):
                 compressed_tokens=original_tokens,
                 compression_ratio=1.0,
                 language=detected_lang,
+                profile=detected_profile,
                 language_confidence=confidence,
                 syntax_valid=True,
             )
@@ -1005,7 +2541,12 @@ class CodeAwareCompressor(Transform):
         # Parse and compress
         try:
             compressed, structure, symbol_scores = self._compress_with_ast(
-                code, detected_lang, context, tokenizer
+                code, detected_lang, detected_profile, context, tokenizer
+            )
+            compressed = _compact_csharp_profile_imports(
+                compressed,
+                detected_lang,
+                detected_profile,
             )
             compressed_tokens = self._estimate_tokens(compressed, tokenizer)
 
@@ -1027,6 +2568,7 @@ class CodeAwareCompressor(Transform):
                     compressed_tokens=original_tokens,
                     compression_ratio=1.0,
                     language=detected_lang,
+                    profile=detected_profile,
                     language_confidence=confidence,
                     syntax_valid=True,
                 )
@@ -1046,6 +2588,7 @@ class CodeAwareCompressor(Transform):
                     compressed_tokens=original_tokens,
                     compression_ratio=1.0,
                     language=detected_lang,
+                    profile=detected_profile,
                     language_confidence=confidence,
                     syntax_valid=True,
                 )
@@ -1079,6 +2622,7 @@ class CodeAwareCompressor(Transform):
                 compressed_tokens=compressed_tokens,
                 compression_ratio=ratio,
                 language=detected_lang,
+                profile=detected_profile,
                 language_confidence=confidence,
                 preserved_imports=len(structure.imports),
                 preserved_signatures=len(structure.function_signatures),
@@ -1099,6 +2643,7 @@ class CodeAwareCompressor(Transform):
                 compressed_tokens=original_tokens,
                 compression_ratio=1.0,
                 language=detected_lang,
+                profile=detected_profile,
                 language_confidence=confidence,
                 syntax_valid=True,
             )
@@ -1107,6 +2652,7 @@ class CodeAwareCompressor(Transform):
         self,
         code: str,
         language: CodeLanguage,
+        profile: CodeProfile,
         context: str,
         tokenizer: Tokenizer | None = None,
     ) -> tuple[str, CodeStructure, dict[str, float]]:
@@ -1129,14 +2675,14 @@ class CodeAwareCompressor(Transform):
         root = tree.root_node
 
         # Analyze symbol importance and allocate compression budget
-        analysis = self._analyze_symbol_importance(root, code, language, context)
+        analysis = self._analyze_symbol_importance(root, code, language, profile, context)
         body_limits = self._allocate_body_budget(analysis, code)
 
         # Extract structure using data-driven language config
         lang_config = _LANG_CONFIGS.get(language)
         if lang_config:
             structure = self._extract_structure(
-                root, code, language, lang_config, body_limits, analysis
+                root, code, language, profile, lang_config, body_limits, analysis
             )
         else:
             structure = self._extract_generic_structure(root, code)
@@ -1163,6 +2709,7 @@ class CodeAwareCompressor(Transform):
         root: Any,
         code: str,
         language: CodeLanguage,
+        profile: CodeProfile,
         lang_config: LangConfig,
         body_limits: dict[str, int],
         analysis: _SymbolAnalysis,
@@ -1202,7 +2749,7 @@ class CodeAwareCompressor(Transform):
                     ):
                         has_func_or_class = True
                         compressed = self._compress_function_ast(
-                            child, code, language, lang_config, body_limits, analysis
+                            child, code, language, profile, lang_config, body_limits, analysis
                         )
                         # Reconstruct export with compressed inner definition
                         export_prefix = code[node.start_byte : child.start_byte]
@@ -1225,11 +2772,11 @@ class CodeAwareCompressor(Transform):
                         decorator_text.append(_get_node_text(child, code))
                     elif child.type in lang_config.function_nodes:
                         definition_compressed = self._compress_function_ast(
-                            child, code, language, lang_config, body_limits, analysis
+                            child, code, language, profile, lang_config, body_limits, analysis
                         )
                     elif child.type in lang_config.class_nodes:
                         definition_compressed = self._compress_class_ast(
-                            child, code, language, lang_config, body_limits, analysis
+                            child, code, language, profile, lang_config, body_limits, analysis
                         )
                 if decorator_text and definition_compressed:
                     full_def = "\n".join(decorator_text) + "\n" + definition_compressed
@@ -1248,7 +2795,7 @@ class CodeAwareCompressor(Transform):
             # Function/method definitions
             if node_type in lang_config.function_nodes:
                 compressed = self._compress_function_ast(
-                    node, code, language, lang_config, body_limits, analysis
+                    node, code, language, profile, lang_config, body_limits, analysis
                 )
                 structure.function_signatures.append(compressed)
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
@@ -1257,7 +2804,7 @@ class CodeAwareCompressor(Transform):
             # Class definitions — compress each method individually
             if node_type in lang_config.class_nodes:
                 compressed = self._compress_class_ast(
-                    node, code, language, lang_config, body_limits, analysis
+                    node, code, language, profile, lang_config, body_limits, analysis
                 )
                 structure.class_definitions.append(compressed)
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
@@ -1283,7 +2830,10 @@ class CodeAwareCompressor(Transform):
             if child_range not in captured_byte_ranges:
                 text = _get_node_text(child, code).strip()
                 if text:
-                    structure.top_level_code.append(text)
+                    summarized = _summarize_top_level_statement(
+                        text, profile, lang_config.comment_prefix
+                    )
+                    structure.top_level_code.append(summarized or text)
 
         return structure
 
@@ -1296,6 +2846,7 @@ class CodeAwareCompressor(Transform):
         node: Any,
         code: str,
         language: CodeLanguage,
+        profile: CodeProfile,
         lang_config: LangConfig,
         body_limits: dict[str, int],
         analysis: _SymbolAnalysis,
@@ -1491,23 +3042,63 @@ class CodeAwareCompressor(Transform):
         # Calculate lines per statement and keep whole statements until budget
         kept_lines: list[str] = []
         kept_line_count = 0
+        actual_kept_line_count = 0
         stmts_kept = 0
+        has_profile_omission_summary = False
+        omitted_stmt_texts: list[str] = []
         total_body_lines_count = sum(end - start + 1 for start, end in body_stmts)
 
-        for start_row, end_row in body_stmts:
+        for stmt_index, (start_row, end_row) in enumerate(body_stmts):
             stmt_lines = code_lines[start_row : end_row + 1]
             stmt_line_count = len(stmt_lines)
+            stmt_text = "\n".join(stmt_lines)
+            preserve_for_profile = _should_preserve_statement_for_profile(stmt_text, profile)
+            summary_line = (
+                _summarize_profile_statement(stmt_text, profile, indent, lang_config.comment_prefix)
+                if preserve_for_profile
+                else None
+            )
 
             # If adding this statement would exceed budget and we already have
             # at least one statement, stop here
-            if kept_line_count + stmt_line_count > body_limit and stmts_kept > 0:
-                break
+            if (
+                not preserve_for_profile
+                and kept_line_count + stmt_line_count > body_limit
+                and stmts_kept > 0
+            ):
+                if profile == CodeProfile.GENERIC:
+                    omitted_stmt_texts.extend(
+                        "\n".join(code_lines[omitted_start : omitted_end + 1])
+                        for omitted_start, omitted_end in body_stmts[stmt_index:]
+                    )
+                    break
+                omitted_stmt_texts.append(stmt_text)
+                continue
 
-            kept_lines.extend(stmt_lines)
-            kept_line_count += stmt_line_count
+            if (
+                not preserve_for_profile
+                and kept_line_count + stmt_line_count > body_limit
+                and stmts_kept == 0
+                and not lang_config.uses_colon_after_signature
+            ):
+                omitted_stmt_texts.append(stmt_text)
+                continue
+
+            if summary_line is not None and len(summary_line.strip()) < len(stmt_text.strip()):
+                kept_lines.append(summary_line)
+                if "body omitted" in summary_line or "handler omitted" in summary_line:
+                    has_profile_omission_summary = True
+                elif "omitted" in summary_line:
+                    omitted_stmt_texts.append(stmt_text)
+                actual_kept_line_count += 1
+            else:
+                kept_lines.extend(stmt_lines)
+                actual_kept_line_count += stmt_line_count
+            if not preserve_for_profile:
+                kept_line_count += stmt_line_count
             stmts_kept += 1
 
-        omitted_lines = total_body_lines_count - kept_line_count
+        omitted_lines = total_body_lines_count - actual_kept_line_count
 
         # Build compressed output preserving original indentation
         result_parts: list[str] = []
@@ -1531,10 +3122,17 @@ class CodeAwareCompressor(Transform):
         if kept_lines:
             result_parts.extend(kept_lines)
 
-        if omitted_lines > 0:
+        if omitted_lines > 0 and not has_profile_omission_summary:
             result_parts.append(
                 _make_omitted_comment(
-                    func_name, omitted_lines, indent, lang_config.comment_prefix, analysis
+                    func_name,
+                    omitted_lines,
+                    indent,
+                    lang_config.comment_prefix,
+                    analysis,
+                    omitted_stmt_texts,
+                    language,
+                    profile,
                 )
             )
             if lang_config.uses_colon_after_signature:
@@ -1552,6 +3150,7 @@ class CodeAwareCompressor(Transform):
         node: Any,
         code: str,
         language: CodeLanguage,
+        profile: CodeProfile,
         lang_config: LangConfig,
         body_limits: dict[str, int],
         analysis: _SymbolAnalysis,
@@ -1569,6 +3168,9 @@ class CodeAwareCompressor(Transform):
         node_lines = code_lines[start_row : end_row + 1]
         node_text = "\n".join(node_lines)
 
+        if start_row == end_row:
+            return node_text
+
         # Find the body node
         body_node = None
         for child in node.children:
@@ -1585,25 +3187,128 @@ class CodeAwareCompressor(Transform):
         sig_end = body_start_line - node_start_line
         header_lines = node_lines[:sig_end] if sig_end > 0 else [node_lines[0]]
 
+        opening_brace_line = None
+        closing_brace_line = None
+        if not lang_config.uses_colon_after_signature:
+            body_end_line = body_node.end_point[0]
+            if code_lines[body_start_line].strip().startswith("{"):
+                opening_brace_line = code_lines[body_start_line]
+            if code_lines[body_end_line].strip().endswith("}"):
+                closing_brace_line = code_lines[body_end_line]
+
+        class_body_lines = [
+            line
+            for line in code_lines[body_node.start_point[0] + 1 : body_node.end_point[0]]
+            if line.strip() and line.strip() not in {"{", "}"}
+        ]
+        class_body_indent = _detect_indent(class_body_lines) if class_body_lines else "    "
+
         # Process each child of the class body individually
         body_parts: list[str] = []
         processed_ranges: list[tuple[int, int]] = []
+        processed_line_ranges: set[tuple[int, int]] = set()
+        pending_member_kind: str | None = None
+        pending_member_summaries: list[str] = []
+        pending_unity_lifecycle_methods: list[str] = []
+
+        def flush_member_group() -> None:
+            nonlocal pending_member_kind, pending_member_summaries
+            if pending_member_kind and pending_member_summaries:
+                body_parts.append(
+                    _summarize_member_group(
+                        pending_member_kind,
+                        pending_member_summaries,
+                        class_body_indent,
+                        lang_config.comment_prefix,
+                    )
+                )
+            pending_member_kind = None
+            pending_member_summaries = []
+
+        def flush_unity_lifecycle_group() -> None:
+            nonlocal pending_unity_lifecycle_methods
+            if pending_unity_lifecycle_methods:
+                method_list = ",".join(pending_unity_lifecycle_methods)
+                body_parts.append(
+                    f"{class_body_indent}{lang_config.comment_prefix} "
+                    f"[unity lifecycle: {method_list}]"
+                )
+            pending_unity_lifecycle_methods = []
 
         for child in body_node.children:
+            if not child.is_named:
+                continue
+
             # Use line-based extraction for children too
             child_start = child.start_point[0]
             child_end = child.end_point[0]
+            child_line_range = (child_start, child_end)
+            if child_line_range in processed_line_ranges:
+                continue
             child_text = "\n".join(code_lines[child_start : child_end + 1])
+
+            effective_type = child.type
+            if child.type == "declaration":
+                for declaration_child in child.children:
+                    if declaration_child.type in {
+                        "field_declaration",
+                        "property_declaration",
+                        "event_declaration",
+                        "event_field_declaration",
+                        "indexer_declaration",
+                    }:
+                        effective_type = declaration_child.type
+                        child_text = _get_node_text(declaration_child, code)
+                        break
+
+            member_kind = _member_group_kind(effective_type, child_text, node_text, profile)
+            if member_kind:
+                summary = _extract_csharp_member_summary(child_text)
+                if summary:
+                    flush_unity_lifecycle_group()
+                    if pending_member_kind and pending_member_kind != member_kind:
+                        flush_member_group()
+                    pending_member_kind = member_kind
+                    pending_member_summaries.append(summary)
+                    processed_ranges.append((child.start_byte, child.end_byte))
+                    processed_line_ranges.add(child_line_range)
+                    continue
+
+            flush_member_group()
 
             # Methods/functions inside the class — compress individually
             if child.type in lang_config.function_nodes:
+                unity_method_summary = (
+                    _summarize_unity_method(
+                        child_text,
+                        node_text,
+                        class_body_indent,
+                        lang_config.comment_prefix,
+                    )
+                    if profile == CodeProfile.UNITY
+                    else None
+                )
+                if unity_method_summary:
+                    summary_kind, summary_text = unity_method_summary
+                    if summary_kind == "lifecycle":
+                        pending_unity_lifecycle_methods.append(summary_text)
+                    else:
+                        flush_unity_lifecycle_group()
+                        body_parts.append(summary_text)
+                    processed_ranges.append((child.start_byte, child.end_byte))
+                    processed_line_ranges.add(child_line_range)
+                    continue
+
+                flush_unity_lifecycle_group()
                 compressed = self._compress_function_ast(
-                    child, code, language, lang_config, body_limits, analysis
+                    child, code, language, profile, lang_config, body_limits, analysis
                 )
                 body_parts.append(compressed)
                 processed_ranges.append((child.start_byte, child.end_byte))
+                processed_line_ranges.add(child_line_range)
             # Decorated methods
             elif lang_config.decorator_node and child.type == lang_config.decorator_node:
+                flush_unity_lifecycle_group()
                 decorator_lines = []
                 method_compressed = None
                 for deco_child in child.children:
@@ -1611,7 +3316,7 @@ class CodeAwareCompressor(Transform):
                         decorator_lines.append(_get_node_text(deco_child, code))
                     elif deco_child.type in lang_config.function_nodes:
                         method_compressed = self._compress_function_ast(
-                            deco_child, code, language, lang_config, body_limits, analysis
+                            deco_child, code, language, profile, lang_config, body_limits, analysis
                         )
                 if decorator_lines and method_compressed:
                     body_parts.append("\n".join(decorator_lines) + "\n" + method_compressed)
@@ -1620,22 +3325,54 @@ class CodeAwareCompressor(Transform):
                 else:
                     body_parts.append(child_text)
                 processed_ranges.append((child.start_byte, child.end_byte))
+                processed_line_ranges.add(child_line_range)
             # Nested classes — recurse
             elif child.type in lang_config.class_nodes:
+                flush_unity_lifecycle_group()
                 compressed = self._compress_class_ast(
-                    child, code, language, lang_config, body_limits, analysis
+                    child, code, language, profile, lang_config, body_limits, analysis
                 )
                 body_parts.append(compressed)
                 processed_ranges.append((child.start_byte, child.end_byte))
+                processed_line_ranges.add(child_line_range)
+            elif profile == CodeProfile.UNITY and child.type.startswith("preproc"):
+                summary = _summarize_unity_preprocessor_block(
+                    child_text, class_body_indent, lang_config.comment_prefix
+                )
+                if summary:
+                    flush_unity_lifecycle_group()
+                    body_parts.append(summary)
+                else:
+                    body_parts.append(child_text)
+                processed_ranges.append((child.start_byte, child.end_byte))
+                processed_line_ranges.add(child_line_range)
             else:
+                flush_unity_lifecycle_group()
                 # Class-level attributes, type annotations, docstrings, etc.
                 # Keep them as-is with original indentation
                 if child_text.strip():
                     body_parts.append(child_text)
                 processed_ranges.append((child.start_byte, child.end_byte))
+                processed_line_ranges.add(child_line_range)
+
+            flush_member_group()
+
+        flush_unity_lifecycle_group()
+        flush_member_group()
+
+        schema_summary = _summarize_schema_only_type(
+            node_text,
+            body_parts,
+            profile,
+            lang_config.comment_prefix,
+        )
+        if schema_summary:
+            return schema_summary
 
         # Reconstruct class with proper indentation
         result_parts = list(header_lines)
+        if opening_brace_line is not None and opening_brace_line not in result_parts:
+            result_parts.append(opening_brace_line)
         for part in body_parts:
             result_parts.append(part)
 
@@ -1645,11 +3382,8 @@ class CodeAwareCompressor(Transform):
         after_lines = node_lines[body_end_rel:]
         if after_lines:
             result_parts.extend(after_lines)
-        elif not lang_config.uses_colon_after_signature:
-            # Ensure closing brace
-            last_body_line = node_lines[-1] if node_lines else ""
-            if last_body_line.strip() == "}":
-                result_parts.append(last_body_line)
+        elif closing_brace_line is not None:
+            result_parts.append(closing_brace_line)
 
         return "\n".join(result_parts)
 
@@ -1676,6 +3410,11 @@ class CodeAwareCompressor(Transform):
             parts.extend(structure.imports)
             parts.append("")
 
+        # C# top-level statements must appear before type declarations.
+        if language == CodeLanguage.CSHARP and structure.top_level_code:
+            parts.extend(structure.top_level_code)
+            parts.append("")
+
         # Type definitions
         if structure.type_definitions:
             parts.extend(structure.type_definitions)
@@ -1692,7 +3431,7 @@ class CodeAwareCompressor(Transform):
             parts.append("")
 
         # Top-level code (global variables, constants, if __name__, etc.)
-        if structure.top_level_code:
+        if language != CodeLanguage.CSHARP and structure.top_level_code:
             parts.extend(structure.top_level_code)
             parts.append("")
 
@@ -1867,10 +3606,18 @@ class CodeAwareCompressor(Transform):
         detection = detect_content_type(text)
         if detection.content_type == ContentType.SOURCE_CODE:
             language = detection.metadata.get("language")
-            result = self.compress(text, language=language, context=context, tokenizer=tokenizer)
+            profile = detection.metadata.get("profile")
+            result = self.compress(
+                text,
+                language=language,
+                profile=profile,
+                context=context,
+                tokenizer=tokenizer,
+            )
             if result.compression_ratio < 0.9:
                 transforms_applied.append(
-                    f"code_aware:{result.language.value}:{result.compression_ratio:.2f}"
+                    f"code_aware:{result.language.value}:{result.profile.value}:"
+                    f"{result.compression_ratio:.2f}"
                 )
                 return result.compressed
         return text
@@ -1948,6 +3695,15 @@ def _is_public_symbol(name: str, language: CodeLanguage) -> bool:
     return not name.startswith("_")
 
 
+def _is_csharp_public_symbol(node: Any, code: str) -> bool:
+    """Heuristic for whether a C# declaration participates in the public API."""
+    declaration = _get_node_text(node, code)
+    header = declaration.split("{", 1)[0].split("=>", 1)[0]
+    if re.search(r"\bprivate\b", header):
+        return False
+    return bool(re.search(r"\b(public|protected|internal)\b", header))
+
+
 def _get_body_limit(
     func_name: str | None,
     body_limits: dict[str, int],
@@ -1963,12 +3719,118 @@ def _get_body_limit(
     return max_body_lines
 
 
+def _summarize_omitted_behavior(
+    omitted_texts: list[str] | None,
+    language: CodeLanguage | None,
+    profile: CodeProfile | None,
+) -> str:
+    """Build a compact behavior hint from omitted statements."""
+    if language != CodeLanguage.CSHARP or not omitted_texts:
+        return ""
+
+    omitted_text = "\n".join(text for text in omitted_texts if text.strip())
+    if not omitted_text.strip():
+        return ""
+
+    parts: list[str] = []
+    operation_names = _extract_omitted_call_names(omitted_text)
+    if operation_names:
+        parts.append("ops: " + ", ".join(operation_names[:5]))
+
+    flow_markers: list[str] = []
+    if re.search(r"\b(for|foreach|while)\b", omitted_text):
+        flow_markers.append("loops")
+    if re.search(r"\b(if|switch)\b", omitted_text):
+        flow_markers.append("branches")
+    if re.search(r"\b(try|catch|finally)\b", omitted_text):
+        flow_markers.append("error-handling")
+    if flow_markers:
+        parts.append("flow: " + ",".join(flow_markers))
+
+    if "await " in omitted_text:
+        parts.append("awaits")
+    if re.search(r"\bthrow\b", omitted_text):
+        parts.append("throws")
+    if re.search(r"\breturn\b", omitted_text):
+        parts.append("returns")
+    if _has_omitted_write_activity(omitted_text, profile):
+        parts.append("writes")
+
+    return "; " + "; ".join(parts[:5]) if parts else ""
+
+
+def _extract_omitted_call_names(omitted_text: str) -> list[str]:
+    """Extract likely call names from omitted C# statements."""
+    ignored_names = {
+        "if",
+        "for",
+        "foreach",
+        "while",
+        "switch",
+        "catch",
+        "using",
+        "lock",
+        "return",
+        "throw",
+        "new",
+        "nameof",
+        "typeof",
+        "sizeof",
+        "default",
+    }
+    call_names: list[str] = []
+    seen: set[str] = set()
+
+    def add_call(raw_name: str, start_index: int) -> None:
+        previous_char = omitted_text[start_index - 1] if start_index > 0 else ""
+        if previous_char in {".", "?"}:
+            return
+        prefix = omitted_text[max(0, start_index - 6) : start_index].strip()
+        if prefix.endswith("new"):
+            return
+        name = raw_name.replace("?.", ".")
+        first_segment = name.split(".", 1)[0]
+        if first_segment in ignored_names or name in ignored_names:
+            return
+        if name not in seen:
+            seen.add(name)
+            call_names.append(name)
+
+    member_call_pattern = re.compile(
+        r"\b([A-Za-z_][A-Za-z0-9_]*(?:\??\.[A-Za-z_][A-Za-z0-9_]*)+)"
+        r"\s*(?:<[^>\n;{}()]+>)?\s*\("
+    )
+    simple_call_pattern = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^>\n;{}()]+>)?\s*\(")
+
+    for match in member_call_pattern.finditer(omitted_text):
+        add_call(match.group(1), match.start(1))
+    for match in simple_call_pattern.finditer(omitted_text):
+        add_call(match.group(1), match.start(1))
+
+    return call_names
+
+
+def _has_omitted_write_activity(omitted_text: str, profile: CodeProfile | None) -> bool:
+    """Detect omitted statements that likely mutate state or persisted data."""
+    if re.search(r"(?<![=!<>])=(?!=)|\+=|-=|\*=|/=", omitted_text):
+        return True
+    mutation_markers = (".Add(", ".Remove(", ".Update(", ".Save", ".Set", ".Invoke(")
+    if any(marker in omitted_text for marker in mutation_markers):
+        return True
+    if profile in {CodeProfile.EF_CORE, CodeProfile.UNITY}:
+        return any(marker in omitted_text for marker in ("migrationBuilder.", "EntityManager."))
+    return False
+
+
 def _make_omitted_comment(
     func_name: str | None,
     omitted_count: int,
     indent: str,
     comment_prefix: str,
     analysis: _SymbolAnalysis | None,
+    omitted_texts: list[str] | None = None,
+    language: CodeLanguage | None = None,
+    profile: CodeProfile | None = None,
 ) -> str:
     """Build omitted comment with call information from analysis."""
     calls_info = ""
@@ -1985,7 +3847,8 @@ def _make_omitted_comment(
                     if len(called) > 5:
                         calls_info += f" +{len(called) - 5} more"
                 break
-    return f"{indent}{comment_prefix} [{omitted_count} lines omitted{calls_info}]"
+    behavior_info = _summarize_omitted_behavior(omitted_texts, language, profile)
+    return f"{indent}{comment_prefix} [{omitted_count} lines omitted{calls_info}{behavior_info}]"
 
 
 def _detect_indent(lines: list[str]) -> str:

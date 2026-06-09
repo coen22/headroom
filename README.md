@@ -188,7 +188,7 @@ Platform support note: macOS auth reuse via Copilot CLI Keychain storage has bee
 <summary><b>What's inside</b></summary>
 
 - **SmartCrusher** — universal JSON: arrays of dicts, nested objects, mixed types.
-- **CodeCompressor** — AST-aware for Python, JS, Go, Rust, Java, C++.
+- **CodeCompressor** — AST-aware for Python, JS, Go, Rust, Java, C++, C# plus EF Core, Razor, MSBuild, solution, and Unity metadata profiles.
 - **Kompress-base** — our HuggingFace model, trained on agentic traces.
 - **Image compression** — 40–90% reduction via trained ML router.
 - **CacheAligner** — stabilizes prefixes so Anthropic/OpenAI KV caches actually hit.

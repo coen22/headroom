@@ -945,7 +945,15 @@ class ContentRouter(Transform):
             if strategy == CompressionStrategy.MIXED:
                 result = self._compress_mixed(content, context, question, bias=bias)
             else:
-                result = self._compress_pure(content, strategy, context, question, bias=bias)
+                result = self._compress_pure(
+                    content,
+                    strategy,
+                    context,
+                    question,
+                    bias=bias,
+                    language=detection.metadata.get("language"),
+                    profile=detection.metadata.get("profile"),
+                )
 
         # Empty-output guard: compression must NEVER blank out non-empty input.
         # An empty user-message content makes Anthropic reject the whole request
@@ -1145,6 +1153,8 @@ class ContentRouter(Transform):
         context: str,
         question: str | None = None,
         bias: float = 1.0,
+        language: str | None = None,
+        profile: str | None = None,
     ) -> RouterCompressionResult:
         """Compress pure (non-mixed) content.
 
@@ -1161,7 +1171,13 @@ class ContentRouter(Transform):
         original_tokens = len(content.split())
 
         compressed, compressed_tokens, strategy_chain = self._apply_strategy_to_content(
-            content, strategy, context, question=question, bias=bias
+            content,
+            strategy,
+            context,
+            language=language,
+            profile=profile,
+            question=question,
+            bias=bias,
         )
 
         return RouterCompressionResult(
@@ -1185,6 +1201,7 @@ class ContentRouter(Transform):
         strategy: CompressionStrategy,
         context: str,
         language: str | None = None,
+        profile: str | None = None,
         question: str | None = None,
         bias: float = 1.0,
     ) -> tuple[str, int, list[str]]:
@@ -1195,6 +1212,7 @@ class ContentRouter(Transform):
             strategy: Strategy to use.
             context: User context.
             language: Language hint for code.
+            profile: Framework/runtime profile hint for code artifacts.
             question: Optional question for QA-aware compression.
             bias: Compression bias multiplier (>1 = keep more, <1 = keep fewer).
 
@@ -1224,7 +1242,12 @@ class ContentRouter(Transform):
                     compressor = self._get_code_compressor()
                     if compressor:
                         compressor_name = type(compressor).__name__
-                        result = compressor.compress(content, language=language, context=context)
+                        result = compressor.compress(
+                            content,
+                            language=language,
+                            profile=profile,
+                            context=context,
+                        )
                         compressed, compressed_tokens = result.compressed, result.compressed_tokens
                         decision_reason = "code_aware"
                 if compressed is None:
@@ -1667,6 +1690,7 @@ class ContentRouter(Transform):
                             "java",
                             "c",
                             "cpp",
+                            "csharp",
                         ]
                         loaded = []
                         for lang in common_languages:
